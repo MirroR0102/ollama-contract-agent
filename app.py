@@ -288,7 +288,10 @@ def run_review_job(job):
             return
         add_file_to_kb(path)  # 确保已入库（幂等）
         job.total = len(REVIEW_DIMENSIONS)
+        done_n = len(job.results)  # 断点续跑：跳过已完成的维度
         for i, dim in enumerate(REVIEW_DIMENSIONS, 1):
+            if i <= done_n:
+                continue
             if job.should_stop():
                 return
             job.index, job.dim_name, job.text = i, dim["name"], ""
@@ -376,10 +379,28 @@ def api_job_leave(job_id: str):
 
 @app.post("/api/jobs/{job_id}/abort")
 def api_job_abort(job_id: str):
-    """手动中止后台任务（审查页「停止」按钮）。"""
+    """彻底终止后台任务（不可恢复）。"""
     job = get_job(job_id)
     if job:
-        job.abort("已手动停止")
+        job.abort("已手动终止")
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/pause")
+def api_job_pause(job_id: str):
+    """暂停任务（保留进度，可继续）。"""
+    job = get_job(job_id)
+    if job:
+        job.pause()
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/resume")
+def api_job_resume(job_id: str):
+    """从暂停处继续任务。"""
+    job = get_job(job_id)
+    if job:
+        job.resume()
     return {"ok": True}
 
 
@@ -413,6 +434,8 @@ async def api_job_stream(job_id: str):
                 if job.status != "running":
                     if job.status == "done":
                         yield _sse({"type": "done"})
+                    elif job.status == "paused":
+                        yield _sse({"type": "paused", "data": {"results": len(job.results)}})
                     else:
                         yield _sse({"type": "error", "data": {"message": job.error or "任务已中止"}})
                     break

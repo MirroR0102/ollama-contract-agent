@@ -63,15 +63,14 @@ const progFill = document.getElementById('progFill');
 const JOB_KEY = 'contract_review_job';
 let es = null;
 let running = false;
+let paused = false;
 let jobId = null;
 let timerInt = null;
 let startTs = 0;
 let totalDims = 8;
-let curIndex = 0;
-let curName = '';
 let results = [];
-let curCard = null;    // 进行中维度的卡片
-let shownIndex = 0;    // 已展示的进行中维度号（0=无）——防止 snapshot 与 dim_start 重复建卡
+let pending = null;    // 当前进行中维度 {index,name,raw}；null=无
+let curCardEl = null;  // 当前进行中维度的卡片 DOM（token 级流式更新用）
 
 /* ---------- 文件加载 ---------- */
 async function loadFiles() {
@@ -101,8 +100,8 @@ function doneRatio() { return totalDims ? results.length / totalDims : 0; }
 function updateProg() {
   if (!running) return;
   const used = startTs ? fmt((Date.now() - startTs) / 1000) : '0:00';
-  if (curCard) {
-    setProg(doneRatio() * 100, `正在审查 ${curIndex}/${totalDims}：${curName} · 已用 ${used}`);
+  if (pending) {
+    setProg(doneRatio() * 100, `正在审查 ${pending.index}/${totalDims}：${pending.name} · 已用 ${used}`);
   } else {
     setProg(doneRatio() * 100, `已完成 ${results.length}/${totalDims} 个维度 · 已用 ${used}`);
   }
@@ -116,22 +115,41 @@ function stopTimer() { if (timerInt) { clearInterval(timerInt); timerInt = null;
 
 /* ---------- 卡片渲染 ---------- */
 function resetReport() {
+  results = [];
+  pending = null;
   reportBox.innerHTML = '';
   emptyTip.classList.add('hidden');
-  results = [];
-  curCard = null;
-  shownIndex = 0;
 }
-function openDimCard(index, total, name) {
-  const card = document.createElement('div');
-  card.className = 'report-dim';
-  card.innerHTML = `
-    <div class="head">
-      <strong>${index}/${total} ${esc(name)}</strong>
-      <span class="spinner"></span><span style="color:var(--muted);font-size:13px;">审查中…</span>
-    </div>`;
-  reportBox.appendChild(card);
-  curCard = card;
+function cardEl() {
+  const el = document.createElement('div');
+  el.className = 'report-dim';
+  reportBox.appendChild(el);
+  return el;
+}
+/* 数据驱动全量重绘：results 结果卡 + pending 当前维度 loading 卡。
+   维度状态每次变化都整体重建，杜绝「loading 卡残留 / 不被填充」。 */
+function renderAll() {
+  reportBox.innerHTML = '';
+  emptyTip.classList.add('hidden');
+  curCardEl = null;
+  results.forEach(d => fillResultCard(cardEl(), d));
+  if (pending) {
+    const card = cardEl();
+    // 进行中的卡片 = 正在生长的结果卡：无「X/8 审查中」占位头，
+    // 风险标签 / 依据原文 / 审查意见随生成实时长出（updateLiveCard）
+    card.innerHTML = `<div class="head">
+        <strong>${esc(pending.name)}</strong>
+        <span class="risk-slot"></span>
+        <span class="spinner"></span>
+      </div>
+      <div class="body live-body">
+        <div class="lbl">📌 依据原文</div>
+        <div class="evidence-text ev-slot" style="color:var(--muted);">分析中…</div>
+        <div class="lbl">💡 审查意见</div>
+        <div class="op-slot" style="color:var(--muted);">分析中…</div>
+      </div>`;
+    curCardEl = card;
+  }
   reportBox.scrollTop = reportBox.scrollHeight;
 }
 function fillResultCard(card, d) {
@@ -146,14 +164,52 @@ function fillResultCard(card, d) {
       <div>${esc(d.opinion || '')}</div>
     </div>`;
 }
-function appendResult(d) {
-  const card = document.createElement('div');
-  card.className = 'report-dim';
-  reportBox.appendChild(card);
-  fillResultCard(card, d);
-  curCard = null;
-  reportBox.scrollTop = reportBox.scrollHeight;
+/* ---------- 结构化流式输出 ---------- */
+/* 从「当前维度已生成的原始文本」中容错提取已出现的字段（可能未闭合） */
+function parsePartial(raw) {
+  let t = String(raw || '');
+  const fence = t.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fence) t = fence[1];
+  const un = s => s.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  const g = (key) => {
+    const m = t.match(new RegExp('"' + key + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"'));
+    return m ? un(m[1]) : '';
+  };
+  const gPartial = (key, full) => {
+    if (full) return '';
+    const m = t.match(new RegExp('"' + key + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)$'));
+    return m ? un(m[1]) : '';
+  };
+  const out = { risk: '', evidence: '', opinion: '' };
+  out.risk = g('risk_level');
+  out.evidence = g('evidence');
+  out.opinion = g('opinion');
+  out.evidencePartial = gPartial('evidence', out.evidence);
+  out.opinionPartial = gPartial('opinion', out.opinion);
+  return out;
 }
+function riskTagHTML(level) {
+  const lv = String(level || '未知');
+  return `<span class="risk-tag risk-${esc(lv)}">风险：${esc(lv)}</span>`;
+}
+/* 把当前维度已生成的部分字段实时渲染到进行中卡片（风险标签 → 依据 → 意见打字机） */
+function updateLiveCard() {
+  if (!pending || !curCardEl) return;
+  const f = parsePartial(pending.raw);
+  const q = s => curCardEl.querySelector(s);
+  const riskSlot = q('.risk-slot');
+  if (riskSlot && f.risk && !riskSlot.innerHTML) {
+    riskSlot.innerHTML = riskTagHTML(f.risk);
+    const sp = curCardEl.querySelector('.spinner');
+    if (sp) sp.remove();  // 风险等级已出，去掉加载动画
+  }
+  const evTxt = f.evidence || f.evidencePartial;
+  const opTxt = f.opinion || f.opinionPartial;
+  if (evTxt) { const ev = q('.ev-slot'); if (ev && ev.textContent !== evTxt) ev.textContent = evTxt; }
+  if (opTxt) { const op = q('.op-slot'); if (op && op.textContent !== opTxt) op.textContent = opTxt; }
+  if (evTxt || opTxt) { const box = reportBox; if (box) box.scrollTop = box.scrollHeight; }
+}
+
 function showSummary() {
   const high = results.filter(r => (r.risk_level || '') === '高').length;
   const mid = results.filter(r => (r.risk_level || '') === '中').length;
@@ -165,34 +221,38 @@ function showSummary() {
 
 /* ---------- 状态机 ---------- */
 function closeES() { if (es) { es.close(); es = null; } }
-function setRunning(v) {
-  running = v;
-  reviewBtn.disabled = v;
-  reviewBtn.textContent = v ? '任务进行中…' : '开始审查';
-  stopBtn.style.display = v ? 'inline-block' : 'none';
+function refreshBtns() {
+  if (running) {
+    reviewBtn.disabled = true; reviewBtn.textContent = '任务进行中…';
+    stopBtn.style.display = 'inline-block'; stopBtn.textContent = '⏸ 暂停';
+  } else if (paused) {
+    reviewBtn.disabled = true; reviewBtn.textContent = '已暂停';
+    stopBtn.style.display = 'inline-block'; stopBtn.textContent = '▶ 继续审查';
+  } else {
+    reviewBtn.disabled = false; reviewBtn.textContent = '开始审查';
+    stopBtn.style.display = 'none';
+  }
 }
+function setActive() { running = true; paused = false; refreshBtns(); }
+function setPausedState() { running = false; paused = true; refreshBtns(); }
+function setIdle() { running = false; paused = false; refreshBtns(); }
 function onDimStart(d) {
-  curIndex = d.index || (results.length + 1);
   totalDims = d.total || totalDims;
-  curName = d.name || '';
-  if (d.index && d.index === shownIndex) return;  // 该维度卡片已由 snapshot 建立
-  shownIndex = d.index || curIndex;
-  openDimCard(curIndex, totalDims, curName);
+  if (d.index > 0 && d.name) pending = { index: d.index, name: d.name, raw: '' };
+  renderAll();
   updateProg();
 }
 function onDimDone(d) {
   results.push(d);
-  if (curCard) fillResultCard(curCard, d);
-  curCard = null;
-  shownIndex = 0;
+  pending = null;   // 本维度已完成，等待下一个 dim_start；避免残留 loading 卡
+  renderAll();
   updateProg();
-  reportBox.scrollTop = reportBox.scrollHeight;
 }
 function onDone() {
   stopTimer();
   if (results.length > 0) showSummary();
   setProg(100, '✅ 审查完成，共 ' + results.length + ' 个维度');
-  setRunning(false);
+  setIdle();
   clearJobStorage();
   closeES();
 }
@@ -203,31 +263,39 @@ function onError(msg) {
   tip.style.cssText = 'border:1px solid #fecaca;background:#fef2f2;color:#b91c1c;border-radius:10px;padding:10px 14px;margin-top:10px;font-size:13px;';
   tip.textContent = '审查任务未完成：' + (msg || '未知错误');
   reportBox.appendChild(tip);
-  setRunning(false);
+  setIdle();
   clearJobStorage();
   closeES();
+}
+function onPaused(msg) {
+  stopTimer();
+  setPausedState();
+  setProg(doneRatio() * 100, '⏸ 任务已暂停 · 已完成 ' + results.length + '/' + totalDims + ' 个维度，点「继续审查」接着跑');
+  const tip = document.createElement('div');
+  tip.style.cssText = 'border:1px solid #fde68a;background:#fffbeb;color:#92400e;border-radius:10px;padding:10px 14px;margin-top:10px;font-size:13px;';
+  tip.textContent = '任务已暂停：已完成 ' + results.length + '/' + totalDims + ' 个维度。点击「▶ 继续审查」可从断点继续，已完成的结果会保留。';
+  reportBox.appendChild(tip);
+  closeES();
+  // 注意：保留 jobId 与 sessionStorage，便于刷新/切页后仍可继续
 }
 function handleSnapshot(s) {
   resetReport();
   totalDims = s.total || totalDims;
-  (s.results || []).forEach(d => { results.push(d); appendResult(d); });
+  results = (s.results || []).slice();
   if (s.status === 'running') {
-    setRunning(true);
-    const idx = s.index || 0;
-    const name = s.dim_name || '';
-    if (idx > 0) {
-      shownIndex = idx;
-      curIndex = idx;
-      totalDims = s.total || totalDims;
-      curName = name;
-      openDimCard(idx, totalDims, name);
-    }
-    // idx==0 表示任务刚启动尚未进入维度，等待 dim_start 事件建卡
+    setActive();
+    if (s.index > 0 && s.dim_name) pending = { index: s.index, name: s.dim_name, raw: s.text || '' };
+    renderAll();
+    updateLiveCard();   // 恢复进度时先渲染已生成的部分字段
     startTimer();
     updateProg();
   } else if (s.status === 'done') {
+    renderAll();
     if (results.length) { showSummary(); setProg(100, '✅ 审查完成（历史任务）'); }
-    setRunning(false); clearJobStorage(); closeES();
+    setIdle(); clearJobStorage(); closeES();
+  } else if (s.status === 'paused') {
+    renderAll();
+    onPaused();
   } else {
     onError(s.error || '任务已中止');
   }
@@ -236,17 +304,21 @@ function handle(ev) {
   const t = ev.type, d = ev.data || {};
   if (t === 'snapshot') handleSnapshot(d);
   else if (t === 'dim_start') onDimStart(d);
-  else if (t === 'token') { /* 进度由进度条与耗时呈现，模型原文不展示 */ updateProg(); }
+  else if (t === 'token') {
+    if (pending) pending.raw += (d.text || '');
+    updateLiveCard();   // 结构化流式：逐 token 长出风险标签 / 依据 / 意见
+  }
   else if (t === 'dim_done') onDimDone(d);
   else if (t === 'done') onDone();
+  else if (t === 'paused') onPaused();
   else if (t === 'error') onError(d.message || '未知错误');
 }
 
 /* ---------- 提交 / 订阅 ---------- */
 async function submitReview() {
   const filename = fileSelect.value;
-  if (!filename || running) return;
-  setRunning(true);
+  if (!filename || running || paused) return;
+  setActive();
   resetReport();
   progPanel.style.display = 'block';
   setProg(0, '正在提交审查任务…');
@@ -292,10 +364,20 @@ function maybeRestore() {
       if (!s.exists) { sessionStorage.removeItem(JOB_KEY); return; }
       if (s.status === 'running') {
         jobId = id;
-        setRunning(true);
+        setActive();
         resetReport();
         progPanel.style.display = 'block';
         connect(id);
+      } else if (s.status === 'paused') {
+        // 恢复「已暂停」界面：保留 jobId，可点「继续审查」接着跑
+        jobId = id;
+        setPausedState();
+        resetReport();
+        totalDims = s.total || totalDims;
+        results = (s.results || []).slice();
+        renderAll();
+        progPanel.style.display = 'block';
+        setProg(doneRatio() * 100, '⏸ 任务已暂停 · 已完成 ' + results.length + '/' + totalDims + ' 个维度');
       } else {
         sessionStorage.removeItem(JOB_KEY);
       }
@@ -315,10 +397,18 @@ window.addEventListener('pagehide', () => {
 reviewBtn.addEventListener('click', submitReview);
 stopBtn.addEventListener('click', async () => {
   if (!jobId) return;
+  const action = running ? 'pause' : 'resume';
   try {
-    await fetch('/api/jobs/' + encodeURIComponent(jobId) + '/abort', { method: 'POST' });
-    // 中止结果由 SSE 的 error 事件统一收尾
-  } catch (_) { onError('停止操作失败'); }
+    await fetch('/api/jobs/' + encodeURIComponent(jobId) + '/' + action, { method: 'POST' });
+    if (action === 'pause') {
+      // 服务端会推送 paused 事件收尾；若连接已断则本地兜底进入暂停态
+      setTimeout(() => { if (running) onPaused(); }, 1500);
+    } else {
+      // 继续：重新订阅进度
+      setActive();
+      connect(jobId);
+    }
+  } catch (_) { onError('操作失败'); }
 });
 loadFiles();
 maybeRestore();

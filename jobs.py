@@ -53,17 +53,34 @@ class Job:
                     self.status = "done"
         except JobAbort:
             with self._lock:
-                self.status = "aborted"
+                if self.status != "paused":
+                    self.status = "aborted"
         except Exception as e:  # noqa: BLE001
             with self._lock:
                 self.status = "error"
                 self.error = f"{type(e).__name__}: {e}"
 
-    def abort(self, reason: str = "用户已离开，任务自动中止"):
+    def abort(self, reason: str = "任务已中止"):
+        """彻底终止任务（不再可恢复）。"""
         with self._lock:
-            if self.status == "running":
+            if self.status in ("running", "paused"):
                 self.status = "aborted"
                 self.error = reason
+
+    def pause(self):
+        """暂停任务：保留已完成结果，可随时 resume 续跑。"""
+        with self._lock:
+            if self.status == "running":
+                self.status = "paused"
+
+    def resume(self):
+        """从暂停处继续任务（跳过已完成维度）。"""
+        with self._lock:
+            if self.status == "paused":
+                self.status = "running"
+                self.last_seen = time.time()
+                self._thread = threading.Thread(target=self._run, daemon=True)
+                self._thread.start()
 
     # ---------- 订阅 ----------
     def attach(self):
@@ -102,9 +119,19 @@ class Job:
 
     # ---------- SSE 增量事件 ----------
     def events_since(self, last: dict):
-        """基于游标 last 生成增量事件（type, payload），并更新游标。"""
+        """基于游标 last 生成增量事件（type, payload），并更新游标。
+
+        顺序保证：先发已完成的 dim_done（上一维度），再发 dim_start（新维度开始），
+        最后才是新维度的 token 流。若顺序颠倒，前端会先建新维度卡又被 dim_done
+        重建，导致「进行中卡片丢失、进度看似卡住」。
+        """
         evs = []
-        # 维度推进
+        # ① 新完成的维度（结果）—— 必须先于下一个 dim_start
+        nr = len(self.results)
+        while last["nres"] < nr:
+            evs.append(("dim_done", self.results[last["nres"]]))
+            last["nres"] += 1
+        # ② 维度推进（新维度开始）
         if self.index != last["index"]:
             if self.status == "running":
                 evs.append(("dim_start", {
@@ -112,16 +139,11 @@ class Job:
                 }))
             last["index"] = self.index
             last["textlen"] = 0  # 新阶段文本从零重新计数
-        # 流式文本增量
+        # ③ 流式文本增量（属于当前维度）
         t = self.text or ""
         if len(t) > last["textlen"]:
             evs.append(("token", {"text": t[last["textlen"]:]}))
             last["textlen"] = len(t)
-        # 新完成的维度
-        nr = len(self.results)
-        while last["nres"] < nr:
-            evs.append(("dim_done", self.results[last["nres"]]))
-            last["nres"] += 1
         # 状态变化
         if self.status != last["status"]:
             last["status"] = self.status

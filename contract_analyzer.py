@@ -29,11 +29,14 @@ _DIM_PROMPT = """你是资深企业法务顾问，正在对一份合同做专项
 【合同条款片段】
 {context}
 
-请严格按以下 JSON 格式输出（不要输出其他内容）：
+若合同条款片段中确实没有该维度的任何相关约定，risk_level 必须填"未约定"，
+evidence 填"未找到相关条款"，opinion 简要说明该约定空白可能带来的风险。
+
+请严格按以下 JSON 格式输出（不要输出任何其他文字、说明或代码块）：
 {{
   "risk_level": "高/中/低/未约定",
   "evidence": "从片段中摘录的关键原文（无则填：未找到相关条款）",
-  "opinion": "对该维度的风险分析与修改建议（40-100字）"
+  "opinion": "对该维度的风险分析与修改建议（40-100字，纯文本，不要再输出JSON）"
 }}
 """
 
@@ -78,23 +81,71 @@ def _dimension_retriever(filename: str, top_k: int = _DIM_TOP_K):
 
 
 def _parse_json_response(text: str) -> dict:
-    """从模型输出中容错解析 JSON（模型可能带 ```json 包裹或夹杂说明）。"""
-    text = text.strip()
-    # 去掉 ```json ... ``` 包裹
-    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
-    if fence:
-        text = fence.group(1).strip()
-    # 提取第一个 { ... } 块
-    match = re.search(r"\{.*\}", text, re.S)
-    if match:
-        text = match.group(0)
-    try:
-        import json
+    """从模型输出中容错解析 JSON（模型可能带 ```json 包裹或夹杂说明）。
+    解析失败时逐字段提取，保证 opinion 为可读文本、绝不把原始 JSON 泄漏给前端。
+    """
+    import json
 
-        return json.loads(text)
-    except Exception:  # noqa: BLE001
-        # 解析失败时返回原始文本，由上层兜底
-        return {"raw": text, "risk_level": "未知", "opinion": text[:100]}
+    def _candidate(s: str):
+        """尝试截出最外层 { ... }。"""
+        start = s.find("{")
+        if start == -1:
+            return None
+        depth, end = 0, -1
+        for k in range(start, len(s)):
+            ch = s[k]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = k + 1
+                    break
+        return s[start:end] if end > start else None
+
+    t = text.strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)```", t, re.S)
+    if fence:
+        t = fence.group(1).strip()
+    cand = _candidate(t)
+    if cand:
+        try:
+            obj = json.loads(cand)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:  # noqa: BLE001
+            pass
+    # 整段解析失败：逐字段正则提取（去掉转义）
+    field_pat = re.compile(r'"(risk_level|evidence|opinion)"\s*:\s*"((?:[^"\\]|\\.)*)"')
+    found = {}
+    for m in field_pat.finditer(t):
+        key, val = m.group(1), m.group(2)
+        val = val.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+        if key not in found:
+            found[key] = val
+    if found.get("risk_level") or found.get("opinion"):
+        return {
+            "risk_level": found.get("risk_level", "未知"),
+            "evidence": found.get("evidence", ""),
+            "opinion": found.get("opinion", ""),
+        }
+    # 彻底失败：给出友好兜底，绝不外露原始 JSON
+    return {
+        "risk_level": "未知",
+        "evidence": "模型输出格式异常，未能提取条款原文",
+        "opinion": "该维度审查结果格式异常，建议重新审查或人工核对合同相关条款。",
+    }
+
+
+_MISSING_HINTS = ("未找到", "未约定", "未检索", "没有相关", "无相关", "未对")
+
+
+def _looks_missing(r: dict) -> bool:
+    """判断模型是否认定该维度在合同中缺失（约定空白）。"""
+    if str(r.get("risk_level", "")).strip() == "未约定":
+        return True
+    ev = str(r.get("evidence", "")) or ""
+    return any(h in ev for h in _MISSING_HINTS)
 
 
 def analyze_dimension(filename: str, dim: dict, stream: bool = True, emit=None) -> dict:
@@ -120,6 +171,14 @@ def analyze_dimension(filename: str, dim: dict, stream: bool = True, emit=None) 
     raw_text = stream_generate(prompt, echo=stream, emit=emit)
     parsed = _parse_json_response(raw_text)
     parsed["dimension"] = dim["name"]
+    # 约定空白兜底：若该维度在合同中缺失，按配置升级风险并给出「请详细确认」引导
+    if _looks_missing(parsed):
+        parsed["risk_level"] = dim.get("missing_risk", "高")
+        parsed["evidence"] = f"本合同未检索到与「{dim['name']}」相关的明确约定条款（约定空白）。"
+        parsed["opinion"] = dim.get(
+            "missing_tip",
+            "合同对该内容未作约定，存在风险，建议补充完善并与对方书面确认。",
+        )
     return parsed
 
 
