@@ -8,23 +8,33 @@ tools.py —— 自定义工具集（供 Agent 自主调用）
   4. list_contract_files        查看库内可用合同清单
 """
 from langchain.tools import tool
+from langchain_core.runnables import RunnableConfig
 
+import session_context
 from contract_analyzer import analyze_contract, _list_contract_files
 from contract_kb import kb_query
 from element_extractor import extract_elements
 
 
+def _thread_sources(config: RunnableConfig):
+    """从工具运行时 config 取 thread_id，查该会话选定的上下文合同范围（None=全部）。"""
+    thread_id = (config.get("configurable") or {}).get("thread_id")
+    return session_context.get_sources(thread_id) if thread_id else None
+
+
 @tool
-def search_contract_knowledge(query: str) -> str:
+def search_contract_knowledge(query: str, config: RunnableConfig) -> str:
     """
     检索企业内部合同知识库并基于合同原文回答问题。
     当用户询问“合同里怎么约定的 / 某条款是什么 / 知识库中的合同内容”时必须调用本工具。
+    注意：检索范围仅限当前会话选定的上下文合同；若该范围内无相关内容，如实告知用户，不要编造。
     Args:
         query: 用户的合同相关问题
     """
-    answer, docs = kb_query(query, top_k=3)
+    sources = _thread_sources(config)
+    answer, docs = kb_query(query, top_k=3, sources=sources)
     if not docs:
-        return "知识库未检索到相关合同内容，可能尚未入库。"
+        return "知识库未检索到相关合同内容，可能尚未入库或不在当前上下文合同范围内。"
     lines = [f"【回答】{answer}", "【引用来源】"]
     seen = set()
     for d in docs:
@@ -80,8 +90,12 @@ def extract_contract_elements_tool(contract_name: str) -> str:
 
 
 @tool
-def list_contract_files_tool() -> str:
-    """列出当前合同库中已有哪些合同文件。当用户问“有哪些合同/有什么文件”时调用。"""
+def list_contract_files_tool(config: RunnableConfig) -> str:
+    """列出当前可用的合同文件。当用户问“有哪些合同/有什么文件”时调用。"""
+    sources = _thread_sources(config)
+    if sources:
+        return ("当前上下文合同范围（仅以下文件作为检索依据）：\n"
+                + "\n".join(f"- {s}" for s in sources))
     files = _list_contract_files()
     if not files:
         return "合同目录为空，尚未导入任何合同。"

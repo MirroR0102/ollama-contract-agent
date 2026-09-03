@@ -25,6 +25,7 @@ from contract_analyzer import REVIEW_DIMENSIONS, analyze_dimension
 from contract_kb import _KB_PROMPT, _format_context, llm
 from element_extractor import extract_elements
 from jobs import JobAbort, create_job, get_job, keepalive_all
+import session_context
 from vector_store import add_file_to_kb, db_stats, get_retriever
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -52,6 +53,16 @@ async def _keepalive_middleware(request, call_next):
     """用户仍在发起请求 → 浏览器仍在使用 → 给后台任务续期（避免误中止）。"""
     keepalive_all()
     return await call_next(request)
+
+
+@app.middleware("http")
+async def _no_cache_static(request, call_next):
+    """页面与静态资源禁用缓存：改版后刷新即可看到最新版本（避免浏览器命中旧 HTML/JS/CSS）。"""
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/static/") or path in ("/", "/kb", "/review", "/ingest"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 # ==================== SSE 基础设施 ====================
@@ -178,22 +189,27 @@ def api_files():
 # ==================== SSE 流式接口 ====================
 class KBQueryBody(BaseModel):
     question: str
-    top_k: int = 3
+    top_k: int = 3  # 检索返回片段数（默认 top 3）
+    sources: list[str] = []  # 上下文合同范围（空 = 全部合同）
 
 
 @app.post("/api/kb/query")
 def api_kb_query(body: KBQueryBody):
-    """知识库 RAG 问答（纯检索 + 流式回答，带证据片段）。"""
+    """知识库 RAG 问答（纯检索 + 流式回答，带证据片段）。
+    - sources 非空时仅在这些合同文件内检索；空 = 全部合同。"""
 
     def worker(send, stop):
         if not _try_lock():
             send("error", {"message": _BUSY_MSG})
             return
         try:
-            retriever = get_retriever(body.top_k)
+            retriever = get_retriever(body.top_k, sources=body.sources or None)
             docs = retriever.invoke(body.question)
             if not docs:
-                send("message", {"text": "知识库未检索到相关合同内容，请先到「合同入库」页导入合同。"})
+                if body.sources:
+                    send("message", {"text": "当前选定的上下文合同范围内未检索到相关内容：请确认所选合同已入库，或改为使用「全部合同」后重试。"})
+                else:
+                    send("message", {"text": "知识库未检索到相关合同内容，请先到「合同入库」页导入合同。"})
                 return
             # ① 证据片段
             send("evidence", {
@@ -221,17 +237,21 @@ def api_kb_query(body: KBQueryBody):
 class ChatBody(BaseModel):
     message: str
     thread_id: str = "web_default"
+    sources: list[str] = []  # 上下文合同范围（空 = 全部合同）
 
 
 @app.post("/api/chat")
 def api_chat(body: ChatBody):
-    """Agent 多轮对话（工具调用事件 + 流式回答）。"""
+    """Agent 多轮对话（工具调用事件 + 流式回答）。
+    发送前把用户选定的上下文合同范围登记到该会话，Agent 检索工具据此限定范围。"""
 
     def worker(send, stop):
         if not _try_lock():
             send("error", {"message": _BUSY_MSG})
             return
         try:
+            # 登记该会话的上下文合同范围（空 = 全部），供 Agent 检索工具读取
+            session_context.set_sources(body.thread_id, body.sources or None)
             tool_names: dict = {}
             for chunk, metadata in kb_agent.stream(
                 {"messages": [HumanMessage(content=body.message)]},

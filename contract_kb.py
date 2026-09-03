@@ -65,13 +65,14 @@ def stream_generate(prompt: str, echo: bool = True, emit=None) -> str:
     return "".join(collected)
 
 
-def kb_query(user_query: str, top_k: int = 3, emit=None) -> tuple:
+def kb_query(user_query: str, top_k: int = 3, emit=None, sources: list = None) -> tuple:
     """
     知识库 RAG 问答（内部供工具/Agent 调用，静默收集不打印）。
     - emit：可选回调，逐 token 转发（Web 端 SSE 用）
+    - sources：可选，仅在这些合同文件范围内检索；None/空 = 全部合同
     返回：(回答文本, 检索到的切片列表)；检索为空时回答为提示语。
     """
-    retriever = get_retriever(top_k)
+    retriever = get_retriever(top_k, sources=sources)
     docs = retriever.invoke(user_query)
     if not docs:
         return "知识库中未检索到相关合同内容，请先入库合同文档。", []

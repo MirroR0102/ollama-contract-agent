@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>智能体对话 · Contract AI</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=2">
 </head>
 <body>
   <header class="navbar">
@@ -20,7 +20,7 @@
   <main class="container">
     <div class="card">
       <div class="page-title">🤖 智能体对话</div>
-      <div class="page-sub">LangGraph 记忆型 Agent：自主判断是否检索知识库 / 审查合同 / 抽取要素，支持多轮上下文记忆。</div>
+      <div class="page-sub">LangGraph 记忆型 Agent：自主判断是否检索知识库 / 审查合同 / 抽取要素，支持多轮上下文记忆。可在下方勾选特定合同，将 Agent 的知识库检索范围限定在其内（默认全部合同）。</div>
 
       <div class="chat" id="chatBox">
         <div class="msg ai">
@@ -33,6 +33,10 @@
         <textarea id="chatInput" rows="2" placeholder="例如：保密协议的保密期限是多久？ / 帮我审查采购合同的风险 / 抽取劳动合同的要素"></textarea>
         <button class="btn btn-primary" id="sendBtn">发送</button>
       </div>
+      <div class="ctx-row" style="margin-top:8px;">
+        <div id="ctxPicker"></div>
+        <span class="ctx-hint">所选合同作为 Agent 的知识库检索范围（未勾选 = 使用全部合同）</span>
+      </div>
       <div style="display:flex;gap:10px;margin-top:10px;align-items:center;">
         <button class="btn btn-ghost" id="newChatBtn">🔄 新对话</button>
         <span id="sessionTag" style="color:var(--muted);font-size:12px;"></span>
@@ -40,7 +44,7 @@
     </div>
   </main>
 
-<script src="/static/main.js"></script>
+<script src="/static/main.js?v=2"></script>
 <script>
 initNav('chat');
 
@@ -53,6 +57,14 @@ const sessionTag = document.getElementById('sessionTag');
 let threadId = sessionStorage.getItem('thread_id') || newThreadId();
 sessionStorage.setItem('thread_id', threadId);
 sessionTag.textContent = '会话ID: ' + threadId.slice(0, 12) + '…（多轮记忆）';
+
+// 用户选定的上下文合同范围（空数组 = 全部合同）
+let ctxSelected = [];
+mountCtxPicker({
+  container: document.getElementById('ctxPicker'),
+  storageKey: 'chat_ctx_sources',
+  onChange: s => { ctxSelected = s; },
+});
 
 // 当前正在生成的 AI 气泡
 let curAi = null;
@@ -97,7 +109,7 @@ async function send() {
   sendBtn.disabled = true;
   addAiBubble();
 
-  await streamSSE('/api/chat', { message, thread_id: threadId }, {
+  await streamSSE('/api/chat', { message, thread_id: threadId, sources: ctxSelected }, {
     onEvent(type, payload) {
       if (type === 'tool_call') {
         aiChip(`<span class="tool-chip">🔧 调用工具：${esc(payload.name)}</span>`);

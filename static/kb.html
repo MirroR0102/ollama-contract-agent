@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>知识库问答 · Contract AI</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=2">
 </head>
 <body>
   <header class="navbar">
@@ -20,18 +20,16 @@
   <main class="container">
     <div class="card">
       <div class="page-title">📚 知识库问答</div>
-      <div class="page-sub">基于本地 Chroma 向量库检索合同原文，严格依据证据回答（无幻觉），适合查询具体条款。</div>
+      <div class="page-sub">基于本地 Chroma 向量库检索合同原文，严格依据证据回答（无幻觉），适合查询具体条款。默认使用全部已入库合同，也可在上方勾选特定合同限定检索范围。</div>
+
+      <div class="ctx-row">
+        <div id="ctxPicker"></div>
+        <span class="ctx-hint">仅以所选合同为上下文作答（未勾选 = 使用全部合同）</span>
+      </div>
 
       <div class="input-row">
         <textarea id="question" rows="2" placeholder="例如：采购合同的付款分几期？违约金怎么约定？"></textarea>
-        <div style="display:flex;flex-direction:column;gap:8px;">
-          <select id="topk" title="检索返回片段数">
-            <option value="3" selected>top 3</option>
-            <option value="5">top 5</option>
-            <option value="1">top 1</option>
-          </select>
-          <button class="btn btn-primary" id="askBtn">提问</button>
-        </div>
+        <button class="btn btn-primary" id="askBtn" style="align-self:flex-end;">提问</button>
       </div>
 
       <div class="result-box" id="resultBox">
@@ -40,7 +38,7 @@
     </div>
   </main>
 
-<script src="/static/main.js"></script>
+<script src="/static/main.js?v=2"></script>
 <script>
 initNav('kb');
 
@@ -48,6 +46,14 @@ const askBtn = document.getElementById('askBtn');
 const qInput = document.getElementById('question');
 const resultBox = document.getElementById('resultBox');
 const emptyTip = document.getElementById('emptyTip');
+
+// 用户选定的上下文合同范围（空数组 = 全部合同）
+let ctxSelected = [];
+mountCtxPicker({
+  container: document.getElementById('ctxPicker'),
+  storageKey: 'kb_ctx_sources',
+  onChange: s => { ctxSelected = s; },
+});
 
 // 当前回答的 DOM 引用
 let answerBubble = null;
@@ -83,7 +89,7 @@ async function ask() {
   askBtn.disabled = true;
   resetUI();
 
-  await streamSSE('/api/kb/query', { question, top_k: parseInt(document.getElementById('topk').value, 10) }, {
+  await streamSSE('/api/kb/query', { question, sources: ctxSelected }, {
     onEvent(type, payload) {
       if (type === 'evidence') {
         (payload.items || []).forEach(appendEvidence);

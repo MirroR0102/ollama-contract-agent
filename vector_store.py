@@ -77,10 +77,15 @@ def add_dir_to_kb(dir_path: str) -> int:
     return added
 
 
-def get_retriever(top_k: int = 3):
-    """获取标准检索器（返回与问题最相关的 top_k 个合同片段）。"""
+def get_retriever(top_k: int = 3, sources: list = None):
+    """获取标准检索器（返回与问题最相关的 top_k 个合同片段）。
+    - sources：可选，仅在这些合同文件（source 元数据）范围内检索；None/空 = 全部合同。
+    """
     db = get_db()
-    return db.as_retriever(search_kwargs={"k": top_k})
+    kwargs: dict = {"k": top_k}
+    if sources:
+        kwargs["filter"] = {"source": {"$in": list(sources)}}
+    return db.as_retriever(search_kwargs=kwargs)
 
 
 def db_stats() -> dict:
