@@ -16,8 +16,9 @@ from config import CONTRACTS_DIR, REVIEW_DIMENSIONS
 from contract_kb import llm, stream_generate
 from vector_store import add_file_to_kb, get_db
 
-# 单维度检索片段数
-_DIM_TOP_K = 2
+# 单维度检索片段数（答辩实测：top_k=2 在万字合同中可能漏检关键条款，
+# 导致「其实有约定却被判约定空白」的误报；调到 4 后命中率显著提升）
+_DIM_TOP_K = 4
 
 # 每维度定向分析提示词
 _DIM_PROMPT = """你是资深企业法务顾问，正在对一份合同做专项风险审查。
@@ -147,6 +148,30 @@ def _looks_missing(r: dict) -> bool:
     return any(h in ev for h in _MISSING_HINTS)
 
 
+# 每个维度用于「规则复核空白」的条款性强关键词：
+# 若检索片段命中这些词，说明该维度其实有约定，模型报「未约定」属于误报。
+_DIM_KEYWORDS = {
+    "违约金与赔偿": ["违约金", "赔偿", "损失"],
+    "付款与结算": ["付款", "支付", "结算", "定金", "发票", "逾期付款"],
+    "保密义务": ["保密信息", "保密", "秘密"],
+    "合同解除与终止": ["解除", "终止", "单方解除"],
+    "知识产权": ["知识产权", "著作权", "归属", "许可", "专利"],
+    "争议解决": ["管辖", "法院", "仲裁", "争议"],
+    "责任限制与免责": ["责任", "上限", "赔偿", "不可抗力", "免责", "间接损失"],
+    "核心义务与违约责任": ["义务", "验收", "交付", "违约", "逾期"],
+}
+
+
+def _has_dim_hits(docs, dim: dict) -> bool:
+    """规则复核：检索片段里是否实际含有该维度的条款性强关键词。
+    用于拦截「模型误报约定空白」——片段明明有条款却被判未约定。"""
+    kws = _DIM_KEYWORDS.get(dim.get("name", ""), [])
+    if not kws:
+        return False
+    text = "\n".join((d.page_content or "") for d in docs)
+    return any(k in text for k in kws)
+
+
 def analyze_dimension(filename: str, dim: dict, stream: bool = True, emit=None,
                       owner: str = None) -> dict:
     """对单个风险维度做定向检索 + 大模型流式分析，返回结构化结果。
@@ -172,14 +197,31 @@ def analyze_dimension(filename: str, dim: dict, stream: bool = True, emit=None,
     raw_text = stream_generate(prompt, echo=stream, emit=emit)
     parsed = _parse_json_response(raw_text)
     parsed["dimension"] = dim["name"]
-    # 约定空白兜底：若该维度在合同中缺失，按配置升级风险并给出「请详细确认」引导
+    # ---- 约定空白：双层确认 ----
+    # ① 模型报「未约定」时先用规则复核检索片段：若片段实际含该维度条款性关键词，
+    #    判定为模型误报 → 降级为「中风险·建议人工复核」，绝不误报高风险空白。
+    # ② 只有片段确实无相关约定，才按配置判高风险并给出「请书面确认」引导。
     if _looks_missing(parsed):
-        parsed["risk_level"] = dim.get("missing_risk", "高")
-        parsed["evidence"] = f"本合同未检索到与「{dim['name']}」相关的明确约定条款（约定空白）。"
-        parsed["opinion"] = dim.get(
-            "missing_tip",
-            "合同对该内容未作约定，存在风险，建议补充完善并与对方书面确认。",
-        )
+        if _has_dim_hits(docs, dim):
+            hit_doc = next(
+                (d for d in docs
+                 if any(k in d.page_content for k in _DIM_KEYWORDS.get(dim["name"], []))),
+                docs[0],
+            )
+            parsed["risk_level"] = "中"
+            parsed["evidence"] = hit_doc.page_content[:160]
+            parsed["opinion"] = (
+                f"模型初判该维度合同未作约定，但规则复核发现原文存在与本维度相关的"
+                f"条款片段（见依据原文）。为避免误报/漏报，建议人工复核该片段以确认"
+                f"风险程度后决定是否需补充完善。"
+            )
+        else:
+            parsed["risk_level"] = dim.get("missing_risk", "高")
+            parsed["evidence"] = f"本合同未检索到与「{dim['name']}」相关的明确约定条款（约定空白）。"
+            parsed["opinion"] = dim.get(
+                "missing_tip",
+                "合同对该内容未作约定，存在风险，建议补充完善并与对方书面确认。",
+            )
     return parsed
 
 
