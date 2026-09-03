@@ -45,6 +45,7 @@ const reportBox = document.getElementById('reportBox');
 const emptyTip = document.getElementById('emptyTip');
 
 let curDimCard = null;   // 当前正在生成中的维度卡片
+let curTokenBox = null;  // 当前维度的实时输出区
 const results = [];      // 完成的维度结果
 
 async function loadFiles() {
@@ -71,19 +72,30 @@ function addDimLoading(name, index, total) {
   card.innerHTML = `
     <div class="head">
       <strong>${index}/${total} ${esc(name)}</strong>
-      <span class="spinner"></span><span style="color:var(--muted);font-size:13px;">审查中…</span>
+      <span class="spinner"></span><span style="color:var(--muted);font-size:13px;">生成中…</span>
+    </div>
+    <div class="token-stream-wrap">
+      <div class="token-stream-label">▍实时生成中（本地模型逐字输出，请稍候）</div>
+      <div class="token-stream"></div>
     </div>`;
   reportBox.appendChild(card);
   curDimCard = card;
+  curTokenBox = card.querySelector('.token-stream');
   reportBox.scrollTop = reportBox.scrollHeight;
+}
+
+/** 追加当前维度的实时生成文本（打字机效果） */
+function appendToken(text) {
+  if (!curTokenBox) return;
+  curTokenBox.textContent += text;
+  const wrap = curTokenBox.parentElement;
+  if (wrap) wrap.scrollTop = wrap.scrollHeight;
 }
 
 function finishDim(d) {
   if (!curDimCard) return;
   const level = d.risk_level || '未知';
   const tag = `<span class="risk-tag risk-${esc(level)}">风险：${esc(level)}</span>`;
-  curDimCard.querySelector('.head').innerHTML = `<strong>${esc(d.dimension || '')}</strong>${tag}`;
-  curDimCard.querySelector('.head').style.alignItems = 'center';
   curDimCard.innerHTML = `
     <div class="head"><strong>${esc(d.dimension || '')}</strong>${tag}</div>
     <div class="body">
@@ -93,6 +105,7 @@ function finishDim(d) {
       <div>${esc(d.opinion || '')}</div>
     </div>`;
   curDimCard = null;
+  curTokenBox = null;
 }
 
 function showSummary() {
@@ -114,6 +127,8 @@ async function review() {
     onEvent(type, payload) {
       if (type === 'dim_start') {
         addDimLoading(payload.name, payload.index, payload.total);
+      } else if (type === 'token') {
+        appendToken(payload.text || '');
       } else if (type === 'dim_done') {
         results.push(payload);
         finishDim(payload);

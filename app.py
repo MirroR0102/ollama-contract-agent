@@ -6,6 +6,7 @@ app.py —— Contract AI 网页版后端（FastAPI + SSE 流式）
 全程本地 Ollama 推理，零云依赖。
 启动：python app.py  →  http://localhost:8000
 """
+import asyncio
 import json
 import os
 import queue
@@ -43,32 +44,56 @@ def _sse(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
-def sse_generator(worker):
+class _ClientGone(Exception):
+    """客户端连接已断开，主动中止当前推理。"""
+
+
+async def sse_generator(worker):
     """
-    通用 SSE 生成器：在后台线程运行 worker(send)，
+    通用 SSE 生成器：在后台线程运行 worker(send, stop)，
     worker 通过 send(type, payload) 推送事件，主线程逐条 yield。
     worker 结束时自动补发 done 事件；异常自动补发 error 事件。
+
+    关键：客户端断开（刷新 / 关闭页面）时，本生成器被 asyncio 取消，
+    finally 中会置 stop 事件；worker 在每轮循环 / 每个 token 处检查
+    stop 即可及时中止推理，尽快释放 MODEL_LOCK，避免整站假死。
     """
     q: queue.Queue = queue.Queue()
+    stop = threading.Event()
 
     def send(etype: str, payload=None):
         q.put((etype, payload))
 
     def run():
         try:
-            worker(send)
+            worker(send, stop)
+        except _ClientGone:
+            pass  # 客户端已断开，静默退出
         except Exception as e:  # noqa: BLE001
-            q.put(("error", {"message": f"{type(e).__name__}: {e}"}))
+            try:
+                q.put(("error", {"message": f"{type(e).__name__}: {e}"}))
+            except Exception:
+                pass
         finally:
-            q.put(("__end__", None))
+            try:
+                q.put(("__end__", None))
+            except Exception:
+                pass
 
     threading.Thread(target=run, daemon=True).start()
-    while True:
-        etype, payload = q.get()
-        if etype == "__end__":
-            break
-        yield _sse({"type": etype, "data": payload})
-    yield _sse({"type": "done"})
+    try:
+        while True:
+            try:
+                etype, payload = q.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.03)  # 轮询间隔：让取消能被及时感知
+                continue
+            if etype == "__end__":
+                break
+            yield _sse({"type": etype, "data": payload})
+        yield _sse({"type": "done"})
+    finally:
+        stop.set()  # 正常结束或客户端断开都会通知 worker 停止
 
 
 def sse_response(worker) -> StreamingResponse:
@@ -144,7 +169,7 @@ class KBQueryBody(BaseModel):
 def api_kb_query(body: KBQueryBody):
     """知识库 RAG 问答（纯检索 + 流式回答，带证据片段）。"""
 
-    def worker(send):
+    def worker(send, stop):
         with MODEL_LOCK:
             retriever = get_retriever(body.top_k)
             docs = retriever.invoke(body.question)
@@ -163,6 +188,8 @@ def api_kb_query(body: KBQueryBody):
             # ② 流式回答
             prompt = _KB_PROMPT.format(context=_format_context(docs), question=body.question)
             for chunk in llm.stream([HumanMessage(content=prompt)]):
+                if stop.is_set():
+                    return
                 piece = chunk.content or ""
                 if piece:
                     send("token", {"text": piece})
@@ -179,7 +206,7 @@ class ChatBody(BaseModel):
 def api_chat(body: ChatBody):
     """Agent 多轮对话（工具调用事件 + 流式回答）。"""
 
-    def worker(send):
+    def worker(send, stop):
         with MODEL_LOCK:
             tool_names: dict = {}
             for chunk, metadata in kb_agent.stream(
@@ -187,6 +214,8 @@ def api_chat(body: ChatBody):
                 config={"configurable": {"thread_id": body.thread_id}},
                 stream_mode="messages",
             ):
+                if stop.is_set():
+                    return
                 # 工具调用决策
                 tcc = getattr(chunk, "tool_call_chunks", None)
                 if tcc:
@@ -215,7 +244,7 @@ class FileBody(BaseModel):
 def api_analyze(body: FileBody):
     """合同 8 维度审查：逐维度流式输出 + 维度完成事件。"""
 
-    def worker(send):
+    def worker(send, stop):
         path = _resolve_anywhere(body.filename)
         if not path:
             send("error", {"message": f"未找到合同文件：{body.filename}"})
@@ -224,11 +253,21 @@ def api_analyze(body: FileBody):
             add_file_to_kb(path)  # 确保已入库（幂等）
             total = len(REVIEW_DIMENSIONS)
             for i, dim in enumerate(REVIEW_DIMENSIONS, 1):
+                if stop.is_set():
+                    return  # 客户端已离开：中止剩余维度，尽快释放模型锁
                 send("dim_start", {"index": i, "total": total, "name": dim["name"]})
-                result = analyze_dimension(
-                    os.path.basename(path), dim, stream=False,
-                    emit=lambda t, _s=send: _s("token", {"text": t}),
-                )
+
+                def emit(t, _s=send, _stop=stop):
+                    if _stop.is_set():
+                        raise _ClientGone()
+                    _s("token", {"text": t})
+
+                try:
+                    result = analyze_dimension(
+                        os.path.basename(path), dim, stream=False, emit=emit,
+                    )
+                except _ClientGone:
+                    return  # 客户端已断开，中止当前维度
                 send("dim_done", result)
 
     return sse_response(worker)
@@ -238,17 +277,23 @@ def api_analyze(body: FileBody):
 def api_extract(body: FileBody):
     """合同关键要素抽取：流式 JSON + 结果事件。"""
 
-    def worker(send):
+    def worker(send, stop):
         path = _resolve_anywhere(body.filename)
         if not path:
             send("error", {"message": f"未找到合同文件：{body.filename}"})
             return
         with MODEL_LOCK:
             send("message", {"text": "正在抽取关键要素...\n"})
-            data = extract_elements(
-                path, stream=False,
-                emit=lambda t, _s=send: _s("token", {"text": t}),
-            )
+
+            def emit(t, _s=send, _stop=stop):
+                if _stop.is_set():
+                    raise _ClientGone()
+                _s("token", {"text": t})
+
+            try:
+                data = extract_elements(path, stream=False, emit=emit)
+            except _ClientGone:
+                return  # 客户端已断开，中止抽取
             send("result", {"data": data})
 
     return sse_response(worker)
