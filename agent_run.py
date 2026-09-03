@@ -17,26 +17,49 @@ from langchain_core.messages import (
 from langgraph.checkpoint.memory import MemorySaver
 
 from config import LLM_MODEL_NAME
-from contract_kb import llm
+from ollama_conn import get_llm
 from tools import ALL_TOOLS
 
 # 初始化会话记忆检查点（短期上下文记忆：同一 thread 记住多轮对话）
 memory = MemorySaver()
 
-# 创建标准 LangChain Agent（系统提示词约束其行为：涉合同必须先查证再作答）
-kb_agent = create_agent(
-    model=llm,
-    tools=ALL_TOOLS,
-    system_prompt=(
-        "你是企业智能合同助手，负责合同知识库问答、合同风险审查与要素抽取。\n"
-        "行为准则：\n"
-        "1. 用户询问合同内容、条款约定时，必须先调用 search_contract_knowledge 检索知识库再回答，禁止凭记忆编造；\n"
-        "2. 用户要求审查/分析合同风险时，调用 analyze_contract_tool；\n"
-        "3. 用户要求提取合同关键信息时，调用 extract_contract_elements_tool；\n"
-        "4. 用户询问有哪些合同时，调用 list_contract_files_tool；\n"
-        "5. 回答尽量给出依据（来源文件/原文片段），语言简洁专业。"
-    ),
+# 系统提示词：约束 Agent 涉合同必须先查证再作答
+_SYSTEM_PROMPT = (
+    "你是企业智能合同助手，负责合同知识库问答、合同风险审查与要素抽取。\n"
+    "行为准则：\n"
+    "1. 用户询问合同内容、条款约定时，必须先调用 search_contract_knowledge 检索知识库再回答，禁止凭记忆编造；\n"
+    "2. 用户要求审查/分析合同风险时，调用 analyze_contract_tool；\n"
+    "3. 用户要求提取合同关键信息时，调用 extract_contract_elements_tool；\n"
+    "4. 用户询问有哪些合同时，调用 list_contract_files_tool；\n"
+    "5. 回答尽量给出依据（来源文件/原文片段），语言简洁专业。"
 )
+
+_agent = None
+
+
+def _build_agent():
+    """创建标准 LangChain Agent（每次重建都会绑定最新的 LLM 连接实例）。"""
+    return create_agent(
+        model=get_llm(),
+        tools=ALL_TOOLS,
+        system_prompt=_SYSTEM_PROMPT,
+    )
+
+
+def get_agent():
+    """返回当前 Agent 实例（惰性创建；连接失效时由 reset_agent 重建）。"""
+    global _agent
+    if _agent is None:
+        _agent = _build_agent()
+    return _agent
+
+
+def reset_agent():
+    """重建 Agent（LLM 连接失效时调用，绑定全新连接后可无损重试整轮）。"""
+    global _agent
+    _agent = _build_agent()
+    print("  [重连] 已重建 LangGraph Agent（绑定新 LLM 连接）", flush=True)
+    return _agent
 
 
 def chat_stream(user_input: str, thread_id: str = "user_001") -> str:
@@ -47,7 +70,7 @@ def chat_stream(user_input: str, thread_id: str = "user_001") -> str:
     full_text: list[str] = []
     tool_names: dict = {}  # 按 index 累积工具名分片
 
-    for chunk, metadata in kb_agent.stream(
+    for chunk, metadata in get_agent().stream(
         {"messages": [HumanMessage(content=user_input)]},
         config={"configurable": {"thread_id": thread_id}},
         stream_mode="messages",
@@ -83,7 +106,7 @@ def chat_stream(user_input: str, thread_id: str = "user_001") -> str:
 
 def chat_once(user_input: str, thread_id: str = "user_001") -> str:
     """发送一轮对话（非交互场景用），返回最终回答文本。"""
-    response = kb_agent.invoke(
+    response = get_agent().invoke(
         {"messages": [HumanMessage(content=user_input)]},
         config={"configurable": {"thread_id": thread_id}},
     )

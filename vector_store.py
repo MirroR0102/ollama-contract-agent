@@ -11,7 +11,8 @@ from langchain_chroma import Chroma
 
 from config import CHROMA_PATH
 from document_loader import load_directory, load_document
-from embedding_client import local_embedding
+from embedding_client import get_embedding
+from ollama_conn import retry_emb_call
 
 
 def _content_hash(text: str, owner: str = "") -> str:
@@ -21,10 +22,10 @@ def _content_hash(text: str, owner: str = "") -> str:
 
 
 def get_db() -> Chroma:
-    """获取 / 初始化本地 Chroma 向量库实例。"""
+    """获取 / 初始化本地 Chroma 向量库实例（绑定最新 embedding 实例）。"""
     return Chroma(
         persist_directory=CHROMA_PATH,
-        embedding_function=local_embedding,
+        embedding_function=get_embedding(),
     )
 
 
@@ -43,12 +44,8 @@ def _existing_hashes(db: Chroma, owner: str = "") -> set:
     return hashes
 
 
-def add_documents(docs: list, owner: str = "") -> int:
-    """
-    向向量库写入切片（同一归属用户内自动跳过已存在内容）。
-    - owner：归属用户名（切片 metadata 写入 owner，检索按此隔离）
-    返回：实际新增条数。
-    """
+def _add_documents_once(docs: list, owner: str) -> int:
+    """单次入库（embedding 连接失效可能抛错，由外层自动重建重试）。"""
     db = get_db()
     existing = _existing_hashes(db, owner)
     new_docs = []
@@ -62,6 +59,16 @@ def add_documents(docs: list, owner: str = "") -> int:
     if new_docs:
         db.add_documents(new_docs)
     return len(new_docs)
+
+
+def add_documents(docs: list, owner: str = "") -> int:
+    """
+    向向量库写入切片（同一归属用户内自动跳过已存在内容）；embedding 连接
+    失效时自动重建实例并重试（自愈，无需重启网页服务）。
+    - owner：归属用户名（切片 metadata 写入 owner，检索按此隔离）
+    返回：实际新增条数。
+    """
+    return retry_emb_call(lambda: _add_documents_once(docs, owner))
 
 
 def add_file_to_kb(file_path: str, owner: str = "") -> int:

@@ -27,12 +27,15 @@ from pydantic import BaseModel
 import auth
 import bootstrap
 import session_context
-from agent_run import kb_agent
+from agent_run import get_agent, reset_agent
 from config import LLM_MODEL_NAME
 from contract_analyzer import REVIEW_DIMENSIONS, analyze_dimension
-from contract_kb import _KB_PROMPT, _format_context, llm
+from contract_kb import _KB_PROMPT, _format_context, stream_generate
 from element_extractor import extract_elements
-from jobs import JobAbort, create_job, get_job, keepalive_all
+from jobs import (JobAbort, _friendly_error, create_job, get_job,
+                  keepalive_all)
+from ollama_conn import (BASE_DELAY, MAX_RETRY, is_conn_error,
+                         retry_emb_call)
 from storage import get_store
 from vector_store import add_file_to_kb, db_stats, get_retriever
 
@@ -256,16 +259,19 @@ class KBQueryBody(BaseModel):
 
 @app.post("/api/kb/query")
 def api_kb_query(body: KBQueryBody, user: dict = Depends(current_user)):
-    """知识库 RAG 问答（仅检索当前用户合同库）。"""
+    """知识库 RAG 问答（仅检索当前用户合同库；Ollama 断连自动重建自愈）。"""
 
     def worker(send, stop):
         if not _try_lock():
             send("error", {"message": _BUSY_MSG})
             return
         try:
-            retriever = get_retriever(body.top_k, sources=body.sources or None,
-                                      owner=user["username"])
-            docs = retriever.invoke(body.question)
+            # 检索：embedding 连接失效时自动重建实例并重试（lambda 内重建检索器，
+            # 确保重试时绑定重建后的新 embedding 实例）
+            docs = retry_emb_call(
+                lambda: get_retriever(body.top_k, sources=body.sources or None,
+                                      owner=user["username"]).invoke(body.question)
+            )
             if not docs:
                 if body.sources:
                     send("message", {"text": "当前选定的上下文合同范围内未检索到相关内容：请确认所选合同已入库，或改为使用「全部合同」后重试。"})
@@ -281,12 +287,18 @@ def api_kb_query(body: KBQueryBody, user: dict = Depends(current_user)):
                 ]
             })
             prompt = _KB_PROMPT.format(context=_format_context(docs), question=body.question)
-            for chunk in llm.stream([HumanMessage(content=prompt)]):
-                if stop.is_set():
-                    return
-                piece = chunk.content or ""
-                if piece:
-                    send("token", {"text": piece})
+
+            def _emit(piece, _stop=stop, _send=send):
+                if _stop.is_set():
+                    raise _ClientGone()
+                _send("token", {"text": piece})
+
+            # 生成：连接失效时 stream_generate 内部自动重建 LLM 连接并重试
+            stream_generate(prompt, echo=False, emit=_emit)
+        except _ClientGone:
+            pass  # 用户手动停止，正常退出（finally 释放模型锁）
+        except Exception as e:  # noqa: BLE001
+            send("error", {"message": _friendly_error(str(e))})
         finally:
             MODEL_LOCK.release()
 
@@ -301,7 +313,7 @@ class ChatBody(BaseModel):
 
 @app.post("/api/chat")
 def api_chat(body: ChatBody, user: dict = Depends(current_user)):
-    """Agent 多轮对话：登记会话的归属用户与合同范围，检索工具据此隔离。"""
+    """Agent 多轮对话：登记会话归属与合同范围；Ollama 断连自动重建 Agent 重试。"""
 
     def worker(send, stop):
         if not _try_lock():
@@ -310,28 +322,54 @@ def api_chat(body: ChatBody, user: dict = Depends(current_user)):
         try:
             session_context.set_owner(body.thread_id, user["username"])
             session_context.set_sources(body.thread_id, body.sources or None)
-            tool_names: dict = {}
-            for chunk, metadata in kb_agent.stream(
-                {"messages": [HumanMessage(content=body.message)]},
-                config={"configurable": {"thread_id": body.thread_id}},
-                stream_mode="messages",
-            ):
-                if stop.is_set():
-                    return
-                tcc = getattr(chunk, "tool_call_chunks", None)
-                if tcc:
-                    for tc in tcc:
-                        idx = tc.get("index", 0)
-                        piece = (tc.get("name") or "").strip()
-                        if piece and idx not in tool_names:
-                            tool_names[idx] = piece
-                            send("tool_call", {"name": piece})
-                text = chunk.content or ""
-                if isinstance(chunk, AIMessageChunk):
-                    if text:
-                        send("token", {"text": text})
-                elif isinstance(chunk, ToolMessage):
-                    send("tool_result", {"text": str(text)[:200]})
+
+            def _run_once():
+                """单轮 Agent 流式推送；返回本轮是否已向客户端推送过内容。"""
+                emitted = False
+                tool_names: dict = {}
+                for chunk, metadata in get_agent().stream(
+                    {"messages": [HumanMessage(content=body.message)]},
+                    config={"configurable": {"thread_id": body.thread_id}},
+                    stream_mode="messages",
+                ):
+                    if stop.is_set():
+                        return emitted
+                    tcc = getattr(chunk, "tool_call_chunks", None)
+                    if tcc:
+                        for tc in tcc:
+                            idx = tc.get("index", 0)
+                            piece = (tc.get("name") or "").strip()
+                            if piece and idx not in tool_names:
+                                tool_names[idx] = piece
+                                send("tool_call", {"name": piece})
+                                emitted = True
+                    text = chunk.content or ""
+                    if isinstance(chunk, AIMessageChunk):
+                        if text:
+                            send("token", {"text": text})
+                            emitted = True
+                    elif isinstance(chunk, ToolMessage):
+                        send("tool_result", {"text": str(text)[:200]})
+                        emitted = True
+                return emitted
+
+            emitted = False
+            for attempt in range(MAX_RETRY + 1):
+                try:
+                    emitted = _run_once()
+                    break  # 整轮成功
+                except Exception as e:  # noqa: BLE001
+                    if attempt < MAX_RETRY and not emitted and is_conn_error(e):
+                        # 连接失效且尚未推送任何内容：重建 Agent（绑定新连接）后
+                        # 整轮重试，对前端无损；已推送过内容则不再重试避免重复
+                        time.sleep(BASE_DELAY * (attempt + 1))
+                        reset_agent()
+                        continue
+                    raise
+        except _ClientGone:
+            pass  # 用户手动停止
+        except Exception as e:  # noqa: BLE001
+            send("error", {"message": _friendly_error(str(e))})
         finally:
             MODEL_LOCK.release()
 

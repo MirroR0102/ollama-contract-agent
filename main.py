@@ -9,8 +9,9 @@ import os
 
 from config import CONTRACTS_DIR, LLM_MODEL_NAME, EMBED_MODEL_NAME
 from contract_analyzer import _list_contract_files, analyze_contract, print_review_report
-from contract_kb import llm, show_rag_demo
+from contract_kb import show_rag_demo
 from element_extractor import extract_elements, print_elements
+from ollama_conn import get_llm
 from vector_store import add_dir_to_kb, add_file_to_kb, clear_db, db_stats
 
 BANNER = f"""
@@ -56,7 +57,7 @@ def main() -> None:
     # 启动自检：验证本地模型连通
     print("⏳ 正在连接本地 Ollama 服务 ...")
     try:
-        llm.invoke("你好")
+        get_llm().invoke("你好")
         print("✅ 大模型连接正常\n")
     except Exception as e:  # noqa: BLE001
         print(f"⚠️  大模型连接失败：{e}")

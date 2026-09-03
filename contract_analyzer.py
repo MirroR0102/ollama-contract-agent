@@ -13,7 +13,8 @@ import re
 from langchain_core.messages import HumanMessage
 
 from config import CONTRACTS_DIR, REVIEW_DIMENSIONS
-from contract_kb import llm, stream_generate
+from contract_kb import stream_generate
+from ollama_conn import retry_emb_call
 from vector_store import add_file_to_kb, get_db
 
 # 单维度检索片段数（答辩实测：top_k=2 在万字合同中可能漏检关键条款，
@@ -178,8 +179,11 @@ def analyze_dimension(filename: str, dim: dict, stream: bool = True, emit=None,
     - emit：可选回调，逐 token 转发生成内容（Web 端 SSE 用）
     - owner：归属用户名（用户隔离）；None = 不限制（命令行单用户用）
     """
-    retriever = _dimension_retriever(filename, owner=owner)
-    docs = retriever.invoke(dim["query"])
+    # 定向检索该维度相关条款（embedding 连接失效时自动重建实例重试：
+    # lambda 内每次重建检索器，确保重试时绑定重建后的新 embedding 实例）
+    docs = retry_emb_call(
+        lambda: _dimension_retriever(filename, owner=owner).invoke(dim["query"])
+    )
     if not docs:
         return {
             "dimension": dim["name"],
