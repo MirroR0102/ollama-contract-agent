@@ -17,6 +17,7 @@
 | ④ 关键要素抽取 ⭐ | 结构化提取合同类型/当事人/金额/期限/日期/管辖等 | 结构化输出 / 提示词工程 |
 | ⑤ 记忆 Agent ⭐ | LangGraph 多轮对话记忆，自动决策调用 4 个工具 | Agent / LangGraph / 短期上下文记忆 |
 | ⑥ 向量库管理 | 状态统计 / 清空 | Chroma 管理 |
+| ⑦ 网页版 ⭐ | FastAPI 封装全部能力 + SSE 流式，浏览器四页面交互 | 服务化封装 / 流式接口 |
 
 ## 二、目录结构
 
@@ -34,6 +35,10 @@ ollama_contract_agent/
 ├── tools.py                 # @tool 工具集（供 Agent 调用）
 ├── agent_run.py             # LangGraph 记忆 Agent 交互对话
 ├── main.py                  # 系统菜单入口（答辩演示用）
+├── app.py                   # 网页版后端（FastAPI + SSE 流式接口）
+├── static/                  # 网页前端（kb/对话/审查/入库 四页面）
+├── uploads/                 # 网页上传的合同（不入库 git）
+├── WEB_PLAN.md              # 网页版开发方案
 └── contracts/               # 演示合同文档（3 份样例，可自行替换）
 ```
 
@@ -71,7 +76,11 @@ pip install -r requirements.txt
 ## 四、快速运行
 
 ```bash
-# 方式一：菜单式全流程（推荐答辩演示）
+# 方式零：网页版（推荐答辩演示，浏览器访问 http://localhost:8000）
+python app.py
+# 页面：/kb 知识库问答  / 智能体对话  /review 合同审查  /ingest 合同入库
+
+# 方式一：菜单式全流程（命令行演示）
 python main.py
 
 # 方式二：直接进入 Agent 多轮对话

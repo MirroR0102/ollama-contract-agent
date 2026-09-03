@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>合同入库 · Contract AI</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="navbar">
+    <div class="brand"><span class="logo">⚖️</span> Contract AI</div>
+    <nav>
+      <a href="/kb" data-page="kb">📚 知识库问答</a>
+      <a href="/" data-page="chat">🤖 智能体对话</a>
+      <a href="/review" data-page="review">📋 合同审查</a>
+      <a href="/ingest" data-page="ingest">📤 合同入库</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <div class="card">
+      <div class="page-title">📤 合同入库</div>
+      <div class="page-sub">上传 txt / pdf 合同 → 智能分块 → 向量化存入本地 Chroma，供知识库问答与合同审查使用。</div>
+
+      <div style="border:2px dashed var(--border);border-radius:14px;padding:28px;text-align:center;background:#f8fafc;" id="dropZone">
+        <div style="font-size:40px;">📄</div>
+        <div style="margin:10px 0 14px;color:var(--muted);">拖拽合同文件到此处，或点击选择（支持 .txt / .pdf）</div>
+        <input type="file" id="fileInput" accept=".txt,.pdf" style="display:none;">
+        <button class="btn btn-primary" id="pickBtn">选择文件</button>
+        <button class="btn btn-primary hidden" id="uploadBtn" style="margin-left:8px;">上传入库</button>
+        <div id="fileName" style="margin-top:10px;font-weight:600;" class="hidden"></div>
+      </div>
+
+      <div id="uploadResult" class="hidden" style="margin-top:14px;padding:12px 16px;border-radius:10px;font-size:14px;"></div>
+    </div>
+
+    <div class="card" style="margin-top:16px;">
+      <div class="page-title" style="font-size:17px;">🗂️ 当前合同库</div>
+      <div id="statsTag" style="color:var(--muted);font-size:13px;margin-bottom:12px;"></div>
+      <div id="fileList"></div>
+      <div class="empty-tip hidden" id="emptyFiles">库中暂无合同，请上传。</div>
+    </div>
+  </main>
+
+<script src="/static/main.js"></script>
+<script>
+initNav('ingest');
+
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const pickBtn = document.getElementById('pickBtn');
+const uploadBtn = document.getElementById('uploadBtn');
+const fileNameBox = document.getElementById('fileName');
+const uploadResult = document.getElementById('uploadResult');
+const fileList = document.getElementById('fileList');
+const statsTag = document.getElementById('statsTag');
+const emptyFiles = document.getElementById('emptyFiles');
+
+let pickedFile = null;
+
+// 拖拽 / 点击选择
+pickBtn.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.style.borderColor = 'var(--primary)'; });
+dropZone.addEventListener('dragleave', () => dropZone.style.borderColor = 'var(--border)');
+dropZone.addEventListener('drop', e => { e.preventDefault(); dropZone.style.borderColor = 'var(--border)'; if (e.dataTransfer.files.length) pick(e.dataTransfer.files[0]); });
+fileInput.addEventListener('change', () => { if (fileInput.files.length) pick(fileInput.files[0]); });
+
+function pick(f) {
+  const ext = f.name.split('.').pop().toLowerCase();
+  if (!['txt', 'pdf'].includes(ext)) { alert('仅支持 txt / pdf 文件'); return; }
+  pickedFile = f;
+  fileNameBox.textContent = '已选择：' + f.name + '（' + (f.size / 1024).toFixed(1) + ' KB）';
+  fileNameBox.classList.remove('hidden');
+  uploadBtn.classList.remove('hidden');
+}
+
+uploadBtn.addEventListener('click', async () => {
+  if (!pickedFile || uploadBtn.disabled) return;
+  uploadBtn.disabled = true;
+  uploadBtn.textContent = '入库中…';
+  const fd = new FormData();
+  fd.append('file', pickedFile);
+  try {
+    const r = await fetch('/api/ingest', { method: 'POST', body: fd });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail || '上传失败');
+    uploadResult.classList.remove('hidden');
+    uploadResult.style.background = '#ecfdf5';
+    uploadResult.style.color = '#065f46';
+    uploadResult.innerHTML = `✅ 入库成功：<b>${esc(j.saved)}</b> ｜ 新增切片 <b>${j.added_chunks}</b> 条`;
+    loadFiles();
+  } catch (e) {
+    uploadResult.classList.remove('hidden');
+    uploadResult.style.background = '#fef2f2';
+    uploadResult.style.color = '#991b1b';
+    uploadResult.textContent = '❌ ' + e.message;
+  } finally {
+    uploadBtn.disabled = false;
+    uploadBtn.textContent = '上传入库';
+  }
+});
+
+async function loadFiles() {
+  try {
+    const r = await fetch('/api/files');
+    const j = await r.json();
+    statsTag.textContent = '模型：' + j.model + ' ｜ 向量库切片：' + (j.stats?.total_chunks ?? 0);
+    fileList.innerHTML = '';
+    if (!j.files || !j.files.length) { emptyFiles.classList.remove('hidden'); return; }
+    emptyFiles.classList.add('hidden');
+    j.files.forEach(f => {
+      const row = document.createElement('div');
+      row.className = 'list-row';
+      row.innerHTML = `<div><div class="fname">📄 ${esc(f.name)}</div>
+        <div class="fmeta">位置：${esc(f.dir === 'contracts' ? '演示库' : '上传库')}</div></div>`;
+      fileList.appendChild(row);
+    });
+  } catch (e) { /* ignore */ }
+}
+
+loadFiles();
+</script>
+</body>
+</html>

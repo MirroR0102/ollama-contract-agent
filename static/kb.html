@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>知识库问答 · Contract AI</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="navbar">
+    <div class="brand"><span class="logo">⚖️</span> Contract AI</div>
+    <nav>
+      <a href="/kb" data-page="kb">📚 知识库问答</a>
+      <a href="/" data-page="chat">🤖 智能体对话</a>
+      <a href="/review" data-page="review">📋 合同审查</a>
+      <a href="/ingest" data-page="ingest">📤 合同入库</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <div class="card">
+      <div class="page-title">📚 知识库问答</div>
+      <div class="page-sub">基于本地 Chroma 向量库检索合同原文，严格依据证据回答（无幻觉），适合查询具体条款。</div>
+
+      <div class="input-row">
+        <textarea id="question" rows="2" placeholder="例如：采购合同的付款分几期？违约金怎么约定？"></textarea>
+        <div style="display:flex;flex-direction:column;gap:8px;">
+          <select id="topk" title="检索返回片段数">
+            <option value="3" selected>top 3</option>
+            <option value="5">top 5</option>
+            <option value="1">top 1</option>
+          </select>
+          <button class="btn btn-primary" id="askBtn">提问</button>
+        </div>
+      </div>
+
+      <div class="result-box" id="resultBox">
+        <div class="empty-tip" id="emptyTip">输入问题后点击「提问」，将展示检索证据与流式回答</div>
+      </div>
+    </div>
+  </main>
+
+<script src="/static/main.js"></script>
+<script>
+initNav('kb');
+
+const askBtn = document.getElementById('askBtn');
+const qInput = document.getElementById('question');
+const resultBox = document.getElementById('resultBox');
+const emptyTip = document.getElementById('emptyTip');
+
+// 当前回答的 DOM 引用
+let answerBubble = null;
+
+function resetUI() {
+  resultBox.innerHTML = '';
+  emptyTip.classList.add('hidden');
+  // 占位回答气泡容器（证据框在其上方动态插入）
+  const wrap = document.createElement('div');
+  wrap.className = 'chat';
+  wrap.innerHTML = `
+    <div class="msg ai">
+      <div class="avatar">🤖</div>
+      <div class="bubble"></div>
+    </div>`;
+  resultBox.appendChild(wrap);
+  answerBubble = wrap.querySelector('.bubble');
+  answerBubble.classList.add('cursor');
+}
+
+function appendEvidence(item) {
+  const box = document.createElement('div');
+  box.className = 'evidence-item';
+  box.innerHTML = `<span class="src">📎 证据 ${item.index}｜来源：${esc(item.source)}</span>${esc(item.content)}`;
+  // 证据框插到回答之前
+  const chat = resultBox.querySelector('.chat');
+  resultBox.insertBefore(box, chat);
+}
+
+async function ask() {
+  const question = qInput.value.trim();
+  if (!question) { qInput.focus(); return; }
+  askBtn.disabled = true;
+  resetUI();
+
+  await streamSSE('/api/kb/query', { question, top_k: parseInt(document.getElementById('topk').value, 10) }, {
+    onEvent(type, payload) {
+      if (type === 'evidence') {
+        (payload.items || []).forEach(appendEvidence);
+      } else if (type === 'token') {
+        answerBubble.textContent += payload.text || '';
+      } else if (type === 'message') {
+        answerBubble.textContent += payload.text || '';
+      }
+    },
+    onDone() { finishAnswer(); },
+    onError(msg) { answerBubble.textContent = '❌ ' + msg; finishAnswer(); }
+  });
+}
+
+function finishAnswer() {
+  answerBubble.classList.remove('cursor');
+  askBtn.disabled = false;
+}
+
+qInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(); }
+});
+askBtn.addEventListener('click', ask);
+</script>
+</body>
+</html>

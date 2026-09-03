@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>合同审查 · Contract AI</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="navbar">
+    <div class="brand"><span class="logo">⚖️</span> Contract AI</div>
+    <nav>
+      <a href="/kb" data-page="kb">📚 知识库问答</a>
+      <a href="/" data-page="chat">🤖 智能体对话</a>
+      <a href="/review" data-page="review">📋 合同审查</a>
+      <a href="/ingest" data-page="ingest">📤 合同入库</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <div class="card">
+      <div class="page-title">📋 合同智能审查</div>
+      <div class="page-sub">对选定合同按 8 个风险维度（违约金 / 付款 / 保密 / 解约 / 知识产权 / 争议解决 / 责任限制 / 核心义务）逐项审查，输出风险等级与修改建议。</div>
+
+      <div class="input-row">
+        <select id="fileSelect" style="flex:1;">
+          <option value="">— 请选择合同 —</option>
+        </select>
+        <button class="btn btn-primary" id="reviewBtn">开始审查</button>
+      </div>
+      <div id="modelTag" style="color:var(--muted);font-size:12px;margin-top:8px;"></div>
+
+      <div class="result-box" id="reportBox">
+        <div class="empty-tip" id="emptyTip">选择一份合同后点击「开始审查」</div>
+      </div>
+    </div>
+  </main>
+
+<script src="/static/main.js"></script>
+<script>
+initNav('review');
+const fileSelect = document.getElementById('fileSelect');
+const reviewBtn = document.getElementById('reviewBtn');
+const reportBox = document.getElementById('reportBox');
+const emptyTip = document.getElementById('emptyTip');
+
+let curDimCard = null;   // 当前正在生成中的维度卡片
+const results = [];      // 完成的维度结果
+
+async function loadFiles() {
+  try {
+    const r = await fetch('/api/files');
+    const j = await r.json();
+    document.getElementById('modelTag').textContent = '模型：' + j.model + ' ｜ 知识库切片：' + (j.stats?.total_chunks ?? 0);
+    fileSelect.innerHTML = '<option value="">— 请选择合同 —</option>' +
+      j.files.map(f => `<option value="${esc(f.name)}">${esc(f.name)}</option>`).join('');
+  } catch (e) {
+    document.getElementById('modelTag').textContent = '加载文件列表失败';
+  }
+}
+
+function resetReport() {
+  reportBox.innerHTML = '';
+  emptyTip.classList.add('hidden');
+  results.length = 0;
+}
+
+function addDimLoading(name, index, total) {
+  const card = document.createElement('div');
+  card.className = 'report-dim';
+  card.innerHTML = `
+    <div class="head">
+      <strong>${index}/${total} ${esc(name)}</strong>
+      <span class="spinner"></span><span style="color:var(--muted);font-size:13px;">审查中…</span>
+    </div>`;
+  reportBox.appendChild(card);
+  curDimCard = card;
+  reportBox.scrollTop = reportBox.scrollHeight;
+}
+
+function finishDim(d) {
+  if (!curDimCard) return;
+  const level = d.risk_level || '未知';
+  const tag = `<span class="risk-tag risk-${esc(level)}">风险：${esc(level)}</span>`;
+  curDimCard.querySelector('.head').innerHTML = `<strong>${esc(d.dimension || '')}</strong>${tag}`;
+  curDimCard.querySelector('.head').style.alignItems = 'center';
+  curDimCard.innerHTML = `
+    <div class="head"><strong>${esc(d.dimension || '')}</strong>${tag}</div>
+    <div class="body">
+      <div class="lbl">📌 依据原文</div>
+      <div class="evidence-text">${esc(d.evidence || '未找到相关条款')}</div>
+      <div class="lbl">💡 审查意见</div>
+      <div>${esc(d.opinion || '')}</div>
+    </div>`;
+  curDimCard = null;
+}
+
+function showSummary() {
+  const high = results.filter(r => r.risk_level === '高').length;
+  const mid = results.filter(r => r.risk_level === '中').length;
+  const box = document.createElement('div');
+  box.style.cssText = 'border:1px solid var(--border);border-radius:12px;padding:14px 16px;background:#f8fafc;font-size:14px;';
+  box.innerHTML = `<strong>📊 审查汇总：</strong>高风险 <b style="color:var(--red)">${high}</b> 项 ｜ 中风险 <b style="color:var(--orange)">${mid}</b> 项 ｜ 共审查 ${results.length} 个维度`;
+  reportBox.appendChild(box);
+}
+
+async function review() {
+  const filename = fileSelect.value;
+  if (!filename || reviewBtn.disabled) return;
+  reviewBtn.disabled = true;
+  resetReport();
+
+  await streamSSE('/api/analyze', { filename }, {
+    onEvent(type, payload) {
+      if (type === 'dim_start') {
+        addDimLoading(payload.name, payload.index, payload.total);
+      } else if (type === 'dim_done') {
+        results.push(payload);
+        finishDim(payload);
+      }
+    },
+    onDone() { showSummary(); finishReview(); },
+    onError(msg) { alert('审查出错：' + msg); finishReview(); }
+  });
+}
+
+function finishReview() {
+  reviewBtn.disabled = false;
+}
+
+reviewBtn.addEventListener('click', review);
+loadFiles();
+</script>
+</body>
+</html>

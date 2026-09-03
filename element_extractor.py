@@ -36,10 +36,11 @@ _EXTRACT_PROMPT = """你是企业合同信息抽取助手。请阅读下方【�
 """
 
 
-def extract_elements(name: str, stream: bool = True) -> dict:
+def extract_elements(name: str, stream: bool = True, emit=None) -> dict:
     """
     抽取一份合同的关键要素（流式生成），返回结构化 dict。
     - stream=True：边生成边打印 JSON（打字机效果）；被 Agent 工具调用时传 False 静默。
+    - emit：可选回调，逐 token 转发（Web 端 SSE 用）
     """
     file_path = _resolve_file(name)
     text = read_plain_text(file_path)
@@ -49,7 +50,7 @@ def extract_elements(name: str, stream: bool = True) -> dict:
         text = text[:MAX_CONTEXT_CHARS]
 
     prompt = _EXTRACT_PROMPT.format(text=text)
-    raw_text = stream_generate(prompt, echo=stream)
+    raw_text = stream_generate(prompt, echo=stream, emit=emit)
     return _parse_json(raw_text)
 
 

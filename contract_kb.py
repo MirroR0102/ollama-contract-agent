@@ -44,11 +44,12 @@ def _format_context(docs) -> str:
     return "\n\n".join(parts)
 
 
-def stream_generate(prompt: str, echo: bool = True) -> str:
+def stream_generate(prompt: str, echo: bool = True, emit=None) -> str:
     """
-    流式生成核心函数：用 llm.stream 逐块生成，
-    echo=True 时边生成边打印（打字机效果），返回完整文本。
-    项目内所有 LLM 生成统一走此函数，保证“全程流式、无等待假死”。
+    流式生成核心函数：用 llm.stream 逐块生成。
+    - echo=True：边生成边打印（打字机效果，命令行/演示用）
+    - emit：可选回调 emit(text片段)，供 Web 端逐 token 转发（SSE）
+    返回完整文本。
     """
     collected: list[str] = []
     for chunk in llm.stream([HumanMessage(content=prompt)]):
@@ -56,15 +57,18 @@ def stream_generate(prompt: str, echo: bool = True) -> str:
         if piece:
             if echo:
                 print(piece, end="", flush=True)
+            if emit is not None:
+                emit(piece)
             collected.append(piece)
     if echo:
         print()  # 收尾换行
     return "".join(collected)
 
 
-def kb_query(user_query: str, top_k: int = 3) -> tuple:
+def kb_query(user_query: str, top_k: int = 3, emit=None) -> tuple:
     """
     知识库 RAG 问答（内部供工具/Agent 调用，静默收集不打印）。
+    - emit：可选回调，逐 token 转发（Web 端 SSE 用）
     返回：(回答文本, 检索到的切片列表)；检索为空时回答为提示语。
     """
     retriever = get_retriever(top_k)
@@ -73,7 +77,7 @@ def kb_query(user_query: str, top_k: int = 3) -> tuple:
         return "知识库中未检索到相关合同内容，请先入库合同文档。", []
 
     prompt = _KB_PROMPT.format(context=_format_context(docs), question=user_query)
-    answer = stream_generate(prompt, echo=False)  # Agent 场景不打印，避免干扰对话流
+    answer = stream_generate(prompt, echo=False, emit=emit)  # Agent 场景不打印，避免干扰对话流
     return answer, docs
 
 

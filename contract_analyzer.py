@@ -97,8 +97,10 @@ def _parse_json_response(text: str) -> dict:
         return {"raw": text, "risk_level": "未知", "opinion": text[:100]}
 
 
-def analyze_dimension(filename: str, dim: dict, stream: bool = True) -> dict:
-    """对单个风险维度做定向检索 + 大模型流式分析，返回结构化结果。"""
+def analyze_dimension(filename: str, dim: dict, stream: bool = True, emit=None) -> dict:
+    """对单个风险维度做定向检索 + 大模型流式分析，返回结构化结果。
+    - emit：可选回调，逐 token 转发生成内容（Web 端 SSE 用）
+    """
     retriever = _dimension_retriever(filename)
     docs = retriever.invoke(dim["query"])
     if not docs:
@@ -114,8 +116,8 @@ def analyze_dimension(filename: str, dim: dict, stream: bool = True) -> dict:
     prompt = _DIM_PROMPT.format(
         dim_name=dim["name"], dim_desc=dim["desc"], context=context
     )
-    # 流式生成该维度的审查 JSON（stream=True 时打字机输出）
-    raw_text = stream_generate(prompt, echo=stream)
+    # 流式生成该维度的审查 JSON（stream=True 时打字机输出 / emit 转发给 Web）
+    raw_text = stream_generate(prompt, echo=stream, emit=emit)
     parsed = _parse_json_response(raw_text)
     parsed["dimension"] = dim["name"]
     return parsed

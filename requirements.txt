@@ -9,3 +9,7 @@ langchain-chroma
 langgraph
 chromadb
 pypdf
+# ---- Web 版（app.py） ----
+fastapi
+uvicorn
+python-multipart

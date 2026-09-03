@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>智能体对话 · Contract AI</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="navbar">
+    <div class="brand"><span class="logo">⚖️</span> Contract AI</div>
+    <nav>
+      <a href="/kb" data-page="kb">📚 知识库问答</a>
+      <a href="/" data-page="chat">🤖 智能体对话</a>
+      <a href="/review" data-page="review">📋 合同审查</a>
+      <a href="/ingest" data-page="ingest">📤 合同入库</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <div class="card">
+      <div class="page-title">🤖 智能体对话</div>
+      <div class="page-sub">LangGraph 记忆型 Agent：自主判断是否检索知识库 / 审查合同 / 抽取要素，支持多轮上下文记忆。</div>
+
+      <div class="chat" id="chatBox">
+        <div class="msg ai">
+          <div class="avatar">🤖</div>
+          <div class="bubble">你好，我是企业合同智能助手 👋 你可以问我合同条款内容、让我审查合同风险或抽取合同要素。</div>
+        </div>
+      </div>
+
+      <div class="input-row" style="margin-top:16px;">
+        <textarea id="chatInput" rows="2" placeholder="例如：保密协议的保密期限是多久？ / 帮我审查采购合同的风险 / 抽取劳动合同的要素"></textarea>
+        <button class="btn btn-primary" id="sendBtn">发送</button>
+      </div>
+      <div style="display:flex;gap:10px;margin-top:10px;align-items:center;">
+        <button class="btn btn-ghost" id="newChatBtn">🔄 新对话</button>
+        <span id="sessionTag" style="color:var(--muted);font-size:12px;"></span>
+      </div>
+    </div>
+  </main>
+
+<script src="/static/main.js"></script>
+<script>
+initNav('chat');
+
+const chatBox = document.getElementById('chatBox');
+const chatInput = document.getElementById('chatInput');
+const sendBtn = document.getElementById('sendBtn');
+const sessionTag = document.getElementById('sessionTag');
+
+// 当前会话（多轮记忆 thread_id），刷新后仍延续
+let threadId = sessionStorage.getItem('thread_id') || newThreadId();
+sessionStorage.setItem('thread_id', threadId);
+sessionTag.textContent = '会话ID: ' + threadId.slice(0, 12) + '…（多轮记忆）';
+
+// 当前正在生成的 AI 气泡
+let curAi = null;
+
+function addUserMsg(text) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg user';
+  wrap.innerHTML = `<div class="avatar">👤</div><div class="bubble">${esc(text)}</div>`;
+  chatBox.appendChild(wrap);
+  chatBox.scrollTop = chatBox.scrollHeight;
+}
+
+function addAiBubble() {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg ai';
+  wrap.innerHTML = `<div class="avatar">🤖</div><div class="bubble"></div>`;
+  chatBox.appendChild(wrap);
+  curAi = wrap;
+  curAi.querySelector('.bubble').classList.add('cursor');
+  chatBox.scrollTop = chatBox.scrollHeight;
+  return curAi;
+}
+
+function aiAppend(text) {
+  if (!curAi) addAiBubble();
+  const b = curAi.querySelector('.bubble');
+  b.insertAdjacentText('beforeend', text);
+  chatBox.scrollTop = chatBox.scrollHeight;
+}
+
+function aiChip(html) {
+  if (!curAi) addAiBubble();
+  curAi.querySelector('.bubble').insertAdjacentHTML('beforeend', html);
+  chatBox.scrollTop = chatBox.scrollHeight;
+}
+
+async function send() {
+  const message = chatInput.value.trim();
+  if (!message || sendBtn.disabled) return;
+  addUserMsg(message);
+  chatInput.value = '';
+  sendBtn.disabled = true;
+  addAiBubble();
+
+  await streamSSE('/api/chat', { message, thread_id: threadId }, {
+    onEvent(type, payload) {
+      if (type === 'tool_call') {
+        aiChip(`<span class="tool-chip">🔧 调用工具：${esc(payload.name)}</span>`);
+      } else if (type === 'tool_result') {
+        aiChip(`<span class="tool-result-chip">📎 ${esc(payload.text)}</span>`);
+      } else if (type === 'token') {
+        aiAppend(payload.text || '');
+      }
+    },
+    onDone() { finishSend(); },
+    onError(msg) { aiAppend('❌ ' + msg); finishSend(); }
+  });
+}
+
+function finishSend() {
+  if (curAi) {
+    const b = curAi.querySelector('.bubble');
+    b.classList.remove('cursor');
+  }
+  sendBtn.disabled = false;
+  chatInput.focus();
+}
+
+chatInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+sendBtn.addEventListener('click', send);
+document.getElementById('newChatBtn').addEventListener('click', () => {
+  threadId = newThreadId();
+  sessionStorage.setItem('thread_id', threadId);
+  sessionTag.textContent = '会话ID: ' + threadId.slice(0, 12) + '…（多轮记忆）';
+  chatBox.innerHTML = `
+    <div class="msg ai"><div class="avatar">🤖</div>
+    <div class="bubble">已开启新会话 👋 请开始提问。</div></div>`;
+});
+</script>
+</body>
+</html>
