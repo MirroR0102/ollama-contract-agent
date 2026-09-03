@@ -27,8 +27,19 @@
           <option value="">— 请选择合同 —</option>
         </select>
         <button class="btn btn-primary" id="reviewBtn">开始审查</button>
+        <button class="btn" id="stopBtn" style="display:none;">⏹ 停止任务</button>
       </div>
       <div id="modelTag" style="color:var(--muted);font-size:12px;margin-top:8px;"></div>
+
+      <div id="progPanel" style="display:none;margin-top:14px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+          <span id="progText" style="font-size:13px;color:var(--muted);"></span>
+          <span id="progPct" style="font-size:13px;font-weight:700;color:var(--primary);"></span>
+        </div>
+        <div style="height:10px;border-radius:8px;background:#e2e8f0;overflow:hidden;">
+          <div id="progFill" style="height:100%;width:0%;border-radius:8px;background:linear-gradient(90deg,#3b82f6,#60a5fa);transition:width .4s ease;"></div>
+        </div>
+      </div>
 
       <div class="result-box" id="reportBox">
         <div class="empty-tip" id="emptyTip">选择一份合同后点击「开始审查」</div>
@@ -41,13 +52,28 @@
 initNav('review');
 const fileSelect = document.getElementById('fileSelect');
 const reviewBtn = document.getElementById('reviewBtn');
+const stopBtn = document.getElementById('stopBtn');
 const reportBox = document.getElementById('reportBox');
 const emptyTip = document.getElementById('emptyTip');
+const progPanel = document.getElementById('progPanel');
+const progText = document.getElementById('progText');
+const progPct = document.getElementById('progPct');
+const progFill = document.getElementById('progFill');
 
-let curDimCard = null;   // 当前正在生成中的维度卡片
-let curTokenBox = null;  // 当前维度的实时输出区
-const results = [];      // 完成的维度结果
+const JOB_KEY = 'contract_review_job';
+let es = null;
+let running = false;
+let jobId = null;
+let timerInt = null;
+let startTs = 0;
+let totalDims = 8;
+let curIndex = 0;
+let curName = '';
+let results = [];
+let curCard = null;    // 进行中维度的卡片
+let shownIndex = 0;    // 已展示的进行中维度号（0=无）——防止 snapshot 与 dim_start 重复建卡
 
+/* ---------- 文件加载 ---------- */
 async function loadFiles() {
   try {
     const r = await fetch('/api/files');
@@ -60,43 +86,58 @@ async function loadFiles() {
   }
 }
 
+/* ---------- 进度条 ---------- */
+function fmt(sec) {
+  const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+  return m + ':' + String(s).padStart(2, '0');
+}
+function setProg(pct, label) {
+  progPanel.style.display = 'block';
+  progFill.style.width = Math.min(100, Math.max(0, pct)) + '%';
+  progPct.textContent = Math.round(pct) + '%';
+  if (label != null) progText.textContent = label;
+}
+function doneRatio() { return totalDims ? results.length / totalDims : 0; }
+function updateProg() {
+  if (!running) return;
+  const used = startTs ? fmt((Date.now() - startTs) / 1000) : '0:00';
+  if (curCard) {
+    setProg(doneRatio() * 100, `正在审查 ${curIndex}/${totalDims}：${curName} · 已用 ${used}`);
+  } else {
+    setProg(doneRatio() * 100, `已完成 ${results.length}/${totalDims} 个维度 · 已用 ${used}`);
+  }
+}
+function startTimer() {
+  startTs = Date.now();
+  stopTimer();
+  timerInt = setInterval(updateProg, 1000);
+}
+function stopTimer() { if (timerInt) { clearInterval(timerInt); timerInt = null; } }
+
+/* ---------- 卡片渲染 ---------- */
 function resetReport() {
   reportBox.innerHTML = '';
   emptyTip.classList.add('hidden');
-  results.length = 0;
+  results = [];
+  curCard = null;
+  shownIndex = 0;
 }
-
-function addDimLoading(name, index, total) {
+function openDimCard(index, total, name) {
   const card = document.createElement('div');
   card.className = 'report-dim';
   card.innerHTML = `
     <div class="head">
       <strong>${index}/${total} ${esc(name)}</strong>
-      <span class="spinner"></span><span style="color:var(--muted);font-size:13px;">生成中…</span>
-    </div>
-    <div class="token-stream-wrap">
-      <div class="token-stream-label">▍实时生成中（本地模型逐字输出，请稍候）</div>
-      <div class="token-stream"></div>
+      <span class="spinner"></span><span style="color:var(--muted);font-size:13px;">审查中…</span>
     </div>`;
   reportBox.appendChild(card);
-  curDimCard = card;
-  curTokenBox = card.querySelector('.token-stream');
+  curCard = card;
   reportBox.scrollTop = reportBox.scrollHeight;
 }
-
-/** 追加当前维度的实时生成文本（打字机效果） */
-function appendToken(text) {
-  if (!curTokenBox) return;
-  curTokenBox.textContent += text;
-  const wrap = curTokenBox.parentElement;
-  if (wrap) wrap.scrollTop = wrap.scrollHeight;
-}
-
-function finishDim(d) {
-  if (!curDimCard) return;
+function fillResultCard(card, d) {
   const level = d.risk_level || '未知';
   const tag = `<span class="risk-tag risk-${esc(level)}">风险：${esc(level)}</span>`;
-  curDimCard.innerHTML = `
+  card.innerHTML = `
     <div class="head"><strong>${esc(d.dimension || '')}</strong>${tag}</div>
     <div class="body">
       <div class="lbl">📌 依据原文</div>
@@ -104,47 +145,183 @@ function finishDim(d) {
       <div class="lbl">💡 审查意见</div>
       <div>${esc(d.opinion || '')}</div>
     </div>`;
-  curDimCard = null;
-  curTokenBox = null;
 }
-
+function appendResult(d) {
+  const card = document.createElement('div');
+  card.className = 'report-dim';
+  reportBox.appendChild(card);
+  fillResultCard(card, d);
+  curCard = null;
+  reportBox.scrollTop = reportBox.scrollHeight;
+}
 function showSummary() {
-  const high = results.filter(r => r.risk_level === '高').length;
-  const mid = results.filter(r => r.risk_level === '中').length;
+  const high = results.filter(r => (r.risk_level || '') === '高').length;
+  const mid = results.filter(r => (r.risk_level || '') === '中').length;
   const box = document.createElement('div');
   box.style.cssText = 'border:1px solid var(--border);border-radius:12px;padding:14px 16px;background:#f8fafc;font-size:14px;';
   box.innerHTML = `<strong>📊 审查汇总：</strong>高风险 <b style="color:var(--red)">${high}</b> 项 ｜ 中风险 <b style="color:var(--orange)">${mid}</b> 项 ｜ 共审查 ${results.length} 个维度`;
   reportBox.appendChild(box);
 }
 
-async function review() {
-  const filename = fileSelect.value;
-  if (!filename || reviewBtn.disabled) return;
-  reviewBtn.disabled = true;
+/* ---------- 状态机 ---------- */
+function closeES() { if (es) { es.close(); es = null; } }
+function setRunning(v) {
+  running = v;
+  reviewBtn.disabled = v;
+  reviewBtn.textContent = v ? '任务进行中…' : '开始审查';
+  stopBtn.style.display = v ? 'inline-block' : 'none';
+}
+function onDimStart(d) {
+  curIndex = d.index || (results.length + 1);
+  totalDims = d.total || totalDims;
+  curName = d.name || '';
+  if (d.index && d.index === shownIndex) return;  // 该维度卡片已由 snapshot 建立
+  shownIndex = d.index || curIndex;
+  openDimCard(curIndex, totalDims, curName);
+  updateProg();
+}
+function onDimDone(d) {
+  results.push(d);
+  if (curCard) fillResultCard(curCard, d);
+  curCard = null;
+  shownIndex = 0;
+  updateProg();
+  reportBox.scrollTop = reportBox.scrollHeight;
+}
+function onDone() {
+  stopTimer();
+  if (results.length > 0) showSummary();
+  setProg(100, '✅ 审查完成，共 ' + results.length + ' 个维度');
+  setRunning(false);
+  clearJobStorage();
+  closeES();
+}
+function onError(msg) {
+  stopTimer();
+  setProg(doneRatio() * 100, '⚠️ ' + (msg || '任务出错'));
+  const tip = document.createElement('div');
+  tip.style.cssText = 'border:1px solid #fecaca;background:#fef2f2;color:#b91c1c;border-radius:10px;padding:10px 14px;margin-top:10px;font-size:13px;';
+  tip.textContent = '审查任务未完成：' + (msg || '未知错误');
+  reportBox.appendChild(tip);
+  setRunning(false);
+  clearJobStorage();
+  closeES();
+}
+function handleSnapshot(s) {
   resetReport();
+  totalDims = s.total || totalDims;
+  (s.results || []).forEach(d => { results.push(d); appendResult(d); });
+  if (s.status === 'running') {
+    setRunning(true);
+    const idx = s.index || 0;
+    const name = s.dim_name || '';
+    if (idx > 0) {
+      shownIndex = idx;
+      curIndex = idx;
+      totalDims = s.total || totalDims;
+      curName = name;
+      openDimCard(idx, totalDims, name);
+    }
+    // idx==0 表示任务刚启动尚未进入维度，等待 dim_start 事件建卡
+    startTimer();
+    updateProg();
+  } else if (s.status === 'done') {
+    if (results.length) { showSummary(); setProg(100, '✅ 审查完成（历史任务）'); }
+    setRunning(false); clearJobStorage(); closeES();
+  } else {
+    onError(s.error || '任务已中止');
+  }
+}
+function handle(ev) {
+  const t = ev.type, d = ev.data || {};
+  if (t === 'snapshot') handleSnapshot(d);
+  else if (t === 'dim_start') onDimStart(d);
+  else if (t === 'token') { /* 进度由进度条与耗时呈现，模型原文不展示 */ updateProg(); }
+  else if (t === 'dim_done') onDimDone(d);
+  else if (t === 'done') onDone();
+  else if (t === 'error') onError(d.message || '未知错误');
+}
 
-  await streamSSE('/api/analyze', { filename }, {
-    onEvent(type, payload) {
-      if (type === 'dim_start') {
-        addDimLoading(payload.name, payload.index, payload.total);
-      } else if (type === 'token') {
-        appendToken(payload.text || '');
-      } else if (type === 'dim_done') {
-        results.push(payload);
-        finishDim(payload);
+/* ---------- 提交 / 订阅 ---------- */
+async function submitReview() {
+  const filename = fileSelect.value;
+  if (!filename || running) return;
+  setRunning(true);
+  resetReport();
+  progPanel.style.display = 'block';
+  setProg(0, '正在提交审查任务…');
+  try {
+    const r = await fetch('/api/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename }),
+    });
+    if (!r.ok) {
+      let msg = r.statusText;
+      try { const j = await r.json(); msg = j.detail || msg; } catch (_) { /* noop */ }
+      throw new Error(msg);
+    }
+    const j = await r.json();
+    totalDims = j.total_dims || 8;
+    jobId = j.job_id;
+    sessionStorage.setItem(JOB_KEY, jobId);
+    setProg(0, '任务已提交，正在加载合同知识库…');
+    connect(jobId);
+  } catch (e) {
+    onError('提交失败：' + e.message);
+  }
+}
+function connect(id) {
+  closeES();
+  es = new EventSource('/api/jobs/' + encodeURIComponent(id) + '/stream');
+  es.onmessage = (e) => { try { handle(JSON.parse(e.data)); } catch (_) { /* noop */ } };
+  // onerror 由 EventSource 自动重连；任务结束统一走 done / error 事件
+}
+function clearJobStorage() {
+  jobId = null;
+  sessionStorage.removeItem(JOB_KEY);
+}
+
+/* ---------- 页面恢复：切页 / 刷新后回来自动续看 ---------- */
+function maybeRestore() {
+  const id = sessionStorage.getItem(JOB_KEY);
+  if (!id) return;
+  fetch('/api/jobs/' + encodeURIComponent(id) + '/status')
+    .then(r => r.json())
+    .then(s => {
+      if (!s.exists) { sessionStorage.removeItem(JOB_KEY); return; }
+      if (s.status === 'running') {
+        jobId = id;
+        setRunning(true);
+        resetReport();
+        progPanel.style.display = 'block';
+        connect(id);
+      } else {
+        sessionStorage.removeItem(JOB_KEY);
       }
-    },
-    onDone() { showSummary(); finishReview(); },
-    onError(msg) { alert('审查出错：' + msg); finishReview(); }
-  });
+    })
+    .catch(() => { /* 服务暂不可用，忽略 */ });
 }
 
-function finishReview() {
-  reviewBtn.disabled = false;
-}
+/* ---------- 离开页面：通知后端（浏览器关闭 / 切页） ---------- */
+window.addEventListener('pagehide', () => {
+  if (es) { es.close(); es = null; }
+  if (jobId) {
+    try { navigator.sendBeacon && navigator.sendBeacon('/api/jobs/' + jobId + '/leave'); } catch (_) { /* noop */ }
+  }
+});
 
-reviewBtn.addEventListener('click', review);
+/* ---------- 事件绑定 ---------- */
+reviewBtn.addEventListener('click', submitReview);
+stopBtn.addEventListener('click', async () => {
+  if (!jobId) return;
+  try {
+    await fetch('/api/jobs/' + encodeURIComponent(jobId) + '/abort', { method: 'POST' });
+    // 中止结果由 SSE 的 error 事件统一收尾
+  } catch (_) { onError('停止操作失败'); }
+});
 loadFiles();
+maybeRestore();
 </script>
 </body>
 </html>

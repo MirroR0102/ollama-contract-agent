@@ -11,9 +11,10 @@ import json
 import os
 import queue
 import threading
+import time
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import AIMessageChunk, HumanMessage, ToolMessage
 from pydantic import BaseModel
@@ -23,6 +24,7 @@ from config import CONTRACTS_DIR, LLM_MODEL_NAME
 from contract_analyzer import REVIEW_DIMENSIONS, analyze_dimension
 from contract_kb import _KB_PROMPT, _format_context, llm
 from element_extractor import extract_elements
+from jobs import JobAbort, create_job, get_job, keepalive_all
 from vector_store import add_file_to_kb, db_stats, get_retriever
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -36,6 +38,20 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # Ollama 单模型串行：全局锁避免并发推理错乱
 MODEL_LOCK = threading.Lock()
+
+_BUSY_MSG = "系统正忙：正在执行合同审查等后台推理任务，请稍候再试。"
+
+
+def _try_lock() -> bool:
+    """即时请求尝试获取模型锁（拿不到即提示忙，避免无限排队假死）。"""
+    return MODEL_LOCK.acquire(timeout=3.0)
+
+
+@app.middleware("http")
+async def _keepalive_middleware(request, call_next):
+    """用户仍在发起请求 → 浏览器仍在使用 → 给后台任务续期（避免误中止）。"""
+    keepalive_all()
+    return await call_next(request)
 
 
 # ==================== SSE 基础设施 ====================
@@ -170,7 +186,10 @@ def api_kb_query(body: KBQueryBody):
     """知识库 RAG 问答（纯检索 + 流式回答，带证据片段）。"""
 
     def worker(send, stop):
-        with MODEL_LOCK:
+        if not _try_lock():
+            send("error", {"message": _BUSY_MSG})
+            return
+        try:
             retriever = get_retriever(body.top_k)
             docs = retriever.invoke(body.question)
             if not docs:
@@ -193,6 +212,8 @@ def api_kb_query(body: KBQueryBody):
                 piece = chunk.content or ""
                 if piece:
                     send("token", {"text": piece})
+        finally:
+            MODEL_LOCK.release()
 
     return sse_response(worker)
 
@@ -207,7 +228,10 @@ def api_chat(body: ChatBody):
     """Agent 多轮对话（工具调用事件 + 流式回答）。"""
 
     def worker(send, stop):
-        with MODEL_LOCK:
+        if not _try_lock():
+            send("error", {"message": _BUSY_MSG})
+            return
+        try:
             tool_names: dict = {}
             for chunk, metadata in kb_agent.stream(
                 {"messages": [HumanMessage(content=body.message)]},
@@ -232,6 +256,8 @@ def api_chat(body: ChatBody):
                         send("token", {"text": text})
                 elif isinstance(chunk, ToolMessage):
                     send("tool_result", {"text": str(text)[:200]})
+        finally:
+            MODEL_LOCK.release()
 
     return sse_response(worker)
 
@@ -240,63 +266,165 @@ class FileBody(BaseModel):
     filename: str
 
 
+# ==================== 后台任务（Job）：跨页面不中断 ====================
+def _wait_model_lock(job):
+    """后台任务等待模型锁：等待期间若任务应停止（中止/用户离开）则退出返回 False。"""
+    while True:
+        if MODEL_LOCK.acquire(timeout=1.0):
+            return True
+        if job.should_stop():
+            return False
+
+
+def run_review_job(job):
+    """合同 8 维度审查任务体：逐维度写入 job 状态，任意页面可订阅。"""
+    if not _wait_model_lock(job):
+        return
+    try:
+        path = _resolve_anywhere(job.filename)
+        if not path:
+            job.status = "error"
+            job.error = f"未找到合同文件：{job.filename}"
+            return
+        add_file_to_kb(path)  # 确保已入库（幂等）
+        job.total = len(REVIEW_DIMENSIONS)
+        for i, dim in enumerate(REVIEW_DIMENSIONS, 1):
+            if job.should_stop():
+                return
+            job.index, job.dim_name, job.text = i, dim["name"], ""
+
+            def emit(t, _j=job):
+                _j.text += t
+                if _j.should_stop():
+                    raise JobAbort()
+
+            result = analyze_dimension(
+                os.path.basename(path), dim, stream=False, emit=emit,
+            )
+            job.results.append(result)
+    finally:
+        MODEL_LOCK.release()
+
+
+def run_extract_job(job):
+    """合同要素抽取任务体。"""
+    if not _wait_model_lock(job):
+        return
+    try:
+        path = _resolve_anywhere(job.filename)
+        if not path:
+            job.status = "error"
+            job.error = f"未找到合同文件：{job.filename}"
+            return
+        job.text = ""
+        job.dim_name = "关键要素抽取"
+        job.total = 1
+        job.index = 1
+
+        def emit(t, _j=job):
+            _j.text += t
+            if _j.should_stop():
+                raise JobAbort()
+
+        job.payload = extract_elements(path, stream=False, emit=emit)
+    finally:
+        MODEL_LOCK.release()
+
+
 @app.post("/api/analyze")
 def api_analyze(body: FileBody):
-    """合同 8 维度审查：逐维度流式输出 + 维度完成事件。"""
-
-    def worker(send, stop):
-        path = _resolve_anywhere(body.filename)
-        if not path:
-            send("error", {"message": f"未找到合同文件：{body.filename}"})
-            return
-        with MODEL_LOCK:
-            add_file_to_kb(path)  # 确保已入库（幂等）
-            total = len(REVIEW_DIMENSIONS)
-            for i, dim in enumerate(REVIEW_DIMENSIONS, 1):
-                if stop.is_set():
-                    return  # 客户端已离开：中止剩余维度，尽快释放模型锁
-                send("dim_start", {"index": i, "total": total, "name": dim["name"]})
-
-                def emit(t, _s=send, _stop=stop):
-                    if _stop.is_set():
-                        raise _ClientGone()
-                    _s("token", {"text": t})
-
-                try:
-                    result = analyze_dimension(
-                        os.path.basename(path), dim, stream=False, emit=emit,
-                    )
-                except _ClientGone:
-                    return  # 客户端已断开，中止当前维度
-                send("dim_done", result)
-
-    return sse_response(worker)
+    """提交合同 8 维度审查任务：立即返回 job_id，进度经 /api/jobs/<id>/stream 订阅。"""
+    path = _resolve_anywhere(body.filename)
+    if not path:
+        raise HTTPException(status_code=404, detail=f"未找到合同文件：{body.filename}")
+    job = create_job("review", body.filename, run_review_job)
+    return {
+        "ok": True,
+        "job_id": job.id,
+        "filename": body.filename,
+        "total_dims": len(REVIEW_DIMENSIONS),
+    }
 
 
 @app.post("/api/extract")
 def api_extract(body: FileBody):
-    """合同关键要素抽取：流式 JSON + 结果事件。"""
+    """提交合同要素抽取任务：立即返回 job_id。"""
+    path = _resolve_anywhere(body.filename)
+    if not path:
+        raise HTTPException(status_code=404, detail=f"未找到合同文件：{body.filename}")
+    job = create_job("extract", body.filename, run_extract_job)
+    return {"ok": True, "job_id": job.id, "filename": body.filename}
 
-    def worker(send, stop):
-        path = _resolve_anywhere(body.filename)
-        if not path:
-            send("error", {"message": f"未找到合同文件：{body.filename}"})
-            return
-        with MODEL_LOCK:
-            send("message", {"text": "正在抽取关键要素...\n"})
 
-            def emit(t, _s=send, _stop=stop):
-                if _stop.is_set():
-                    raise _ClientGone()
-                _s("token", {"text": t})
+@app.get("/api/jobs/{job_id}/status")
+def api_job_status(job_id: str):
+    """查询任务状态（页面刷新 / 重新打开时恢复进度用）。"""
+    job = get_job(job_id)
+    if not job:
+        return {"exists": False}
+    return {"exists": True, **job.snapshot()}
 
-            try:
-                data = extract_elements(path, stream=False, emit=emit)
-            except _ClientGone:
-                return  # 客户端已断开，中止抽取
-            send("result", {"data": data})
 
-    return sse_response(worker)
+@app.post("/api/jobs/{job_id}/leave")
+def api_job_leave(job_id: str):
+    """页面离开时上报（sendBeacon）：后台由此重算「离开超时」。"""
+    job = get_job(job_id)
+    if job:
+        job.touch()
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/abort")
+def api_job_abort(job_id: str):
+    """手动中止后台任务（审查页「停止」按钮）。"""
+    job = get_job(job_id)
+    if job:
+        job.abort("已手动停止")
+    return {"ok": True}
+
+
+@app.get("/api/jobs/{job_id}/stream")
+async def api_job_stream(job_id: str):
+    """订阅任务进度（SSE）。支持多端同时订阅；单个页面断开不影响任务继续。"""
+    job = get_job(job_id)
+    if not job:
+        return JSONResponse(status_code=404, content={"detail": "任务不存在或已过期"})
+
+    async def gen():
+        job.attach()
+        last = {
+            "index": job.index,
+            "textlen": len(job.text or ""),
+            "nres": len(job.results),
+            "status": job.status,
+        }
+        try:
+            yield _sse({"type": "snapshot", "data": job.snapshot()})
+            last_send = time.time()
+            while True:
+                evs = job.events_since(last)
+                now = time.time()
+                if evs or (now - last_send) >= 10:
+                    for etype, payload in evs:
+                        yield _sse({"type": etype, "data": payload})
+                    if not evs:
+                        yield ": ping\n\n"  # 心跳，防止长空闲断连
+                    last_send = now
+                if job.status != "running":
+                    if job.status == "done":
+                        yield _sse({"type": "done"})
+                    else:
+                        yield _sse({"type": "error", "data": {"message": job.error or "任务已中止"}})
+                    break
+                await asyncio.sleep(0.2)
+        finally:
+            job.detach()
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ==================== 上传入库 ====================
