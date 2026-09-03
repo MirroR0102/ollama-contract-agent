@@ -13,3 +13,5 @@ pypdf
 fastapi
 uvicorn
 python-multipart
+# ---- 用户系统（MySQL 后端；仅用 sqlite 可去掉） ----
+pymysql

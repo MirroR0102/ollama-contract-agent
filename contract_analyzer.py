@@ -69,15 +69,14 @@ def _resolve_file(name: str) -> str:
     raise FileNotFoundError(f"未找到合同文件：{name}")
 
 
-def _dimension_retriever(filename: str, top_k: int = _DIM_TOP_K):
-    """构造“仅检索指定合同文件”的检索器（按 source 元数据过滤，避免串库）。"""
+def _dimension_retriever(filename: str, top_k: int = _DIM_TOP_K, owner: str = None):
+    """构造“仅检索指定合同文件”的检索器（按 source + owner 过滤，避免串库）。"""
     db = get_db()
-    return db.as_retriever(
-        search_kwargs={
-            "k": top_k,
-            "filter": {"source": os.path.basename(filename)},
-        }
-    )
+    filters = [{"source": os.path.basename(filename)}]
+    if owner:
+        filters.append({"owner": owner})
+    filt = {"$and": filters} if len(filters) > 1 else filters[0]
+    return db.as_retriever(search_kwargs={"k": top_k, "filter": filt})
 
 
 def _parse_json_response(text: str) -> dict:
@@ -148,11 +147,13 @@ def _looks_missing(r: dict) -> bool:
     return any(h in ev for h in _MISSING_HINTS)
 
 
-def analyze_dimension(filename: str, dim: dict, stream: bool = True, emit=None) -> dict:
+def analyze_dimension(filename: str, dim: dict, stream: bool = True, emit=None,
+                      owner: str = None) -> dict:
     """对单个风险维度做定向检索 + 大模型流式分析，返回结构化结果。
     - emit：可选回调，逐 token 转发生成内容（Web 端 SSE 用）
+    - owner：归属用户名（用户隔离）；None = 不限制（命令行单用户用）
     """
-    retriever = _dimension_retriever(filename)
+    retriever = _dimension_retriever(filename, owner=owner)
     docs = retriever.invoke(dim["query"])
     if not docs:
         return {
@@ -182,19 +183,21 @@ def analyze_dimension(filename: str, dim: dict, stream: bool = True, emit=None) 
     return parsed
 
 
-def analyze_contract(name: str, dims=None, progress: bool = True, stream: bool = True) -> list:
+def analyze_contract(name: str, dims=None, progress: bool = True, stream: bool = True,
+                     owner: str = None) -> list:
     """
     对一份合同执行多维度审查（每维度结果流式输出）。
-    - name: 合同文件名（contracts 目录内）或路径
+    - name: 合同文件名（contracts 目录内）或绝对路径（Web 端传用户目录路径）
     - dims: 需要审查的维度名列表，默认全部 8 项
     - stream: 是否流式打印生成过程（被 Agent 工具调用时传 False 静默执行）
+    - owner: 归属用户名（用户隔离）；None = 不限制（命令行单用户用）
     返回：结构化审查结果列表。
     """
     file_path = _resolve_file(name)
     filename = os.path.basename(file_path)
 
     # 审查前确保该合同已入库（幂等去重），使定向检索可用
-    add_file_to_kb(file_path)
+    add_file_to_kb(file_path, owner=owner)
 
     if dims:
         dim_list = [d for d in REVIEW_DIMENSIONS if d["name"] in dims]
@@ -206,7 +209,7 @@ def analyze_contract(name: str, dims=None, progress: bool = True, stream: bool =
         if progress:
             print(f"\n  [{i}/{len(dim_list)}] 审查维度：{dim['name']}")
             print("  " + "-" * 40)
-        results.append(analyze_dimension(filename, dim, stream=stream))
+        results.append(analyze_dimension(filename, dim, stream=stream, owner=owner))
         if stream:
             print()  # 维度间空行
 

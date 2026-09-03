@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 · Contract AI</title>
+<link rel="stylesheet" href="/static/style.css?v=3">
+</head>
+<body class="auth-body">
+  <div class="auth-card">
+    <div class="auth-brand"><span class="logo">⚖️</span> Contract AI</div>
+    <div class="auth-sub">本地化智能合同审查系统 · 每个账号拥有独立合同库</div>
+
+    <div class="auth-tabs">
+      <button type="button" class="auth-tab active" id="tabLogin">登 录</button>
+      <button type="button" class="auth-tab" id="tabReg">注 册</button>
+    </div>
+
+    <form id="formLogin" autocomplete="off">
+      <label class="auth-label" for="loginUser">用户名</label>
+      <input type="text" id="loginUser" class="auth-input" placeholder="请输入用户名" required>
+      <label class="auth-label" for="loginPass">密码</label>
+      <input type="password" id="loginPass" class="auth-input" placeholder="请输入密码" required>
+      <button type="submit" class="btn btn-primary auth-btn" id="loginBtn">登 录</button>
+    </form>
+
+    <form id="formReg" autocomplete="off" style="display:none;">
+      <label class="auth-label" for="regUser">用户名</label>
+      <input type="text" id="regUser" class="auth-input" placeholder="设置登录用户名（唯一）" required>
+      <label class="auth-label" for="regPass">密码</label>
+      <input type="password" id="regPass" class="auth-input" placeholder="设置密码" required>
+      <label class="auth-label" for="regNick">昵称（可选）</label>
+      <input type="text" id="regNick" class="auth-input" placeholder="显示名称，默认同用户名">
+      <button type="submit" class="btn btn-primary auth-btn" id="regBtn">注册并登录</button>
+    </form>
+
+    <div id="authMsg" class="auth-msg"></div>
+    <div class="auth-hint" id="demoHint">预置演示账号：demo / demo123（含保密协议等演示合同）</div>
+  </div>
+
+<script src="/static/main.js?v=3"></script>
+<script>
+// 已登录则直接进入系统
+if (getToken()) { location.replace('/'); }
+
+const tabLogin = document.getElementById('tabLogin');
+const tabReg = document.getElementById('tabReg');
+const formLogin = document.getElementById('formLogin');
+const formReg = document.getElementById('formReg');
+const msgEl = document.getElementById('authMsg');
+
+function showMsg(text, ok) {
+  msgEl.textContent = text || '';
+  msgEl.style.display = text ? 'block' : 'none';
+  msgEl.className = 'auth-msg ' + (ok ? 'ok' : 'err');
+}
+function switchTab(reg) {
+  tabLogin.classList.toggle('active', !reg);
+  tabReg.classList.toggle('active', reg);
+  formLogin.style.display = reg ? 'none' : 'block';
+  formReg.style.display = reg ? 'block' : 'none';
+  showMsg('');
+}
+tabLogin.addEventListener('click', () => switchTab(false));
+tabReg.addEventListener('click', () => switchTab(true));
+
+async function doAuth(url, body, btn) {
+  btn.disabled = true;
+  showMsg('处理中…', true);
+  try {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { showMsg(j.detail || '操作失败', false); return; }
+    setToken(j.token);
+    showMsg('登录成功，正在进入…', true);
+    setTimeout(() => { location.href = '/'; }, 400);
+  } catch (e) {
+    showMsg('无法连接服务：' + e.message, false);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+formLogin.addEventListener('submit', e => {
+  e.preventDefault();
+  const u = document.getElementById('loginUser').value.trim();
+  const p = document.getElementById('loginPass').value;
+  if (!u || !p) { showMsg('请输入用户名和密码', false); return; }
+  doAuth('/api/auth/login', { username: u, password: p }, document.getElementById('loginBtn'));
+});
+formReg.addEventListener('submit', e => {
+  e.preventDefault();
+  const u = document.getElementById('regUser').value.trim();
+  const p = document.getElementById('regPass').value;
+  const n = document.getElementById('regNick').value.trim();
+  if (!u || !p) { showMsg('请设置用户名和密码', false); return; }
+  doAuth('/api/auth/register', { username: u, password: p, display_name: n },
+         document.getElementById('regBtn'));
+});
+</script>
+</body>
+</html>

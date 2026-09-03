@@ -33,11 +33,12 @@ class JobAbort(Exception):
 
 
 class Job:
-    def __init__(self, kind: str, filename: str, target):
+    def __init__(self, kind: str, filename: str, target, owner: str = None):
         self.id = uuid.uuid4().hex[:12]
         self.kind = kind          # review / extract
         self.filename = filename
-        self.status = "running"   # running / done / error / aborted
+        self.owner = owner        # 归属用户名（鉴权用）
+        self.status = "running"   # running / done / error / aborted / paused
         self.error = None
         # 通用进度字段（worker 更新，SSE 订阅端读取）
         self.total = 0
@@ -188,7 +189,7 @@ _jobs = {}
 _jobs_lock = threading.Lock()
 
 
-def create_job(kind: str, filename: str, target) -> Job:
+def create_job(kind: str, filename: str, target, owner: str = None) -> Job:
     with _jobs_lock:
         # 清理已完成旧任务，防止无限增长
         if len(_jobs) > 50:
@@ -196,7 +197,7 @@ def create_job(kind: str, filename: str, target) -> Job:
             for j in list(_jobs.values()):
                 if j.status != "running" and now - j.last_seen > 3600:
                     _jobs.pop(j.id, None)
-        job = Job(kind, filename, target)
+        job = Job(kind, filename, target, owner=owner)
         _jobs[job.id] = job
         job.start()
         return job

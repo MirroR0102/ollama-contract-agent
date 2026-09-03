@@ -14,12 +14,16 @@ import session_context
 from contract_analyzer import analyze_contract, _list_contract_files
 from contract_kb import kb_query
 from element_extractor import extract_elements
+from storage import get_store
 
 
-def _thread_sources(config: RunnableConfig):
-    """从工具运行时 config 取 thread_id，查该会话选定的上下文合同范围（None=全部）。"""
+def _thread_ctx(config: RunnableConfig):
+    """从工具运行时 config 取 thread_id，查该会话的 (归属用户, 合同范围)。"""
     thread_id = (config.get("configurable") or {}).get("thread_id")
-    return session_context.get_sources(thread_id) if thread_id else None
+    if not thread_id:
+        return None, None
+    return (session_context.get_owner(thread_id),
+            session_context.get_sources(thread_id))
 
 
 @tool
@@ -31,8 +35,8 @@ def search_contract_knowledge(query: str, config: RunnableConfig) -> str:
     Args:
         query: 用户的合同相关问题
     """
-    sources = _thread_sources(config)
-    answer, docs = kb_query(query, top_k=3, sources=sources)
+    owner, sources = _thread_ctx(config)
+    answer, docs = kb_query(query, top_k=3, sources=sources, owner=owner)
     if not docs:
         return "知识库未检索到相关合同内容，可能尚未入库或不在当前上下文合同范围内。"
     lines = [f"【回答】{answer}", "【引用来源】"]
@@ -92,10 +96,14 @@ def extract_contract_elements_tool(contract_name: str) -> str:
 @tool
 def list_contract_files_tool(config: RunnableConfig) -> str:
     """列出当前可用的合同文件。当用户问“有哪些合同/有什么文件”时调用。"""
-    sources = _thread_sources(config)
+    owner, sources = _thread_ctx(config)
     if sources:
         return ("当前上下文合同范围（仅以下文件作为检索依据）：\n"
                 + "\n".join(f"- {s}" for s in sources))
+    if owner:
+        return f"当前账户（{owner}）的合同库文件：\n" + "\n".join(
+            f"- {f['name']}" for f in get_store().list_files(
+                get_store().get_user_by_name(owner)["id"]))
     files = _list_contract_files()
     if not files:
         return "合同目录为空，尚未导入任何合同。"

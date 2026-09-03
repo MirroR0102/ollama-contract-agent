@@ -15,6 +15,8 @@ import threading
 _lock = threading.Lock()
 # thread_id -> list[str] | None   （None 表示全部合同）
 _thread_sources: dict = {}
+# thread_id -> 归属用户名 | None（Web 端必填；None=不隔离，命令行单用户用）
+_thread_owner: dict = {}
 _MAX_THREADS = 500
 
 
@@ -29,6 +31,21 @@ def set_sources(thread_id: str, sources):
         if len(_thread_sources) > _MAX_THREADS:
             for k in list(_thread_sources)[:100]:
                 _thread_sources.pop(k, None)
+                _thread_owner.pop(k, None)
+
+
+def set_owner(thread_id: str, owner):
+    """记录某会话的归属用户（用于向量检索的用户隔离）。"""
+    with _lock:
+        _thread_owner[thread_id] = owner or None
+
+
+def get_owner(thread_id: str):
+    """返回某会话的归属用户（None = 不隔离）。"""
+    if not thread_id:
+        return None
+    with _lock:
+        return _thread_owner.get(thread_id)
 
 
 def get_sources(thread_id: str):

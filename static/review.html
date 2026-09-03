@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>合同审查 · Contract AI</title>
-<link rel="stylesheet" href="/static/style.css?v=2">
+<link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
   <header class="navbar">
@@ -47,9 +47,9 @@
     </div>
   </main>
 
-<script src="/static/main.js?v=2"></script>
+<script src="/static/main.js?v=3"></script>
 <script>
-initNav('review');
+initPage('review');
 const fileSelect = document.getElementById('fileSelect');
 const reviewBtn = document.getElementById('reviewBtn');
 const stopBtn = document.getElementById('stopBtn');
@@ -75,8 +75,7 @@ let curCardEl = null;  // 当前进行中维度的卡片 DOM（token 级流式�
 /* ---------- 文件加载 ---------- */
 async function loadFiles() {
   try {
-    const r = await fetch('/api/files');
-    const j = await r.json();
+    const j = await apiJSON('/api/files');
     document.getElementById('modelTag').textContent = '模型：' + j.model + ' ｜ 知识库切片：' + (j.stats?.total_chunks ?? 0);
     fileSelect.innerHTML = '<option value="">— 请选择合同 —</option>' +
       j.files.map(f => `<option value="${esc(f.name)}">${esc(f.name)}</option>`).join('');
@@ -323,17 +322,11 @@ async function submitReview() {
   progPanel.style.display = 'block';
   setProg(0, '正在提交审查任务…');
   try {
-    const r = await fetch('/api/analyze', {
+    const j = await apiJSON('/api/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ filename }),
     });
-    if (!r.ok) {
-      let msg = r.statusText;
-      try { const j = await r.json(); msg = j.detail || msg; } catch (_) { /* noop */ }
-      throw new Error(msg);
-    }
-    const j = await r.json();
     totalDims = j.total_dims || 8;
     jobId = j.job_id;
     sessionStorage.setItem(JOB_KEY, jobId);
@@ -345,7 +338,7 @@ async function submitReview() {
 }
 function connect(id) {
   closeES();
-  es = new EventSource('/api/jobs/' + encodeURIComponent(id) + '/stream');
+  es = new EventSource('/api/jobs/' + encodeURIComponent(id) + '/stream?token=' + encodeURIComponent(getToken()));
   es.onmessage = (e) => { try { handle(JSON.parse(e.data)); } catch (_) { /* noop */ } };
   // onerror 由 EventSource 自动重连；任务结束统一走 done / error 事件
 }
@@ -358,8 +351,7 @@ function clearJobStorage() {
 function maybeRestore() {
   const id = sessionStorage.getItem(JOB_KEY);
   if (!id) return;
-  fetch('/api/jobs/' + encodeURIComponent(id) + '/status')
-    .then(r => r.json())
+  apiJSON('/api/jobs/' + encodeURIComponent(id) + '/status')
     .then(s => {
       if (!s.exists) { sessionStorage.removeItem(JOB_KEY); return; }
       if (s.status === 'running') {
@@ -389,7 +381,7 @@ function maybeRestore() {
 window.addEventListener('pagehide', () => {
   if (es) { es.close(); es = null; }
   if (jobId) {
-    try { navigator.sendBeacon && navigator.sendBeacon('/api/jobs/' + jobId + '/leave'); } catch (_) { /* noop */ }
+    try { navigator.sendBeacon && navigator.sendBeacon('/api/jobs/' + jobId + '/leave?token=' + encodeURIComponent(getToken())); } catch (_) { /* noop */ }
   }
 });
 
@@ -399,7 +391,7 @@ stopBtn.addEventListener('click', async () => {
   if (!jobId) return;
   const action = running ? 'pause' : 'resume';
   try {
-    await fetch('/api/jobs/' + encodeURIComponent(jobId) + '/' + action, { method: 'POST' });
+    await apiFetch('/api/jobs/' + encodeURIComponent(jobId) + '/' + action, { method: 'POST' });
     if (action === 'pause') {
       // 服务端会推送 paused 事件收尾；若连接已断则本地兜底进入暂停态
       setTimeout(() => { if (running) onPaused(); }, 1500);

@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-app.py —— Contract AI 网页版后端（FastAPI + SSE 流式）
+app.py —— Contract AI 网页版后端（FastAPI + SSE 流式 + 用户系统）
 将本地化合同审查系统的全部能力封装为 HTTP 接口：
-  知识库问答 / Agent 对话 / 合同审查 / 要素抽取 / 合同入库
+  知识库问答 / Agent 对话 / 合同审查 / 要素抽取 / 合同入库 / 用户注册登录
 全程本地 Ollama 推理，零云依赖。
+
+用户体系：注册/登录后发放 token（Authorization: Bearer <token>，
+SSE 的 GET 订阅可用 ?token= 参数）。每个用户的合同库（MySQL/SQLite 归属 +
+Chroma owner 隔离）完全独立、互不可见。
+
 启动：python app.py  →  http://localhost:8000
 """
 import asyncio
@@ -13,29 +18,33 @@ import queue
 import threading
 import time
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import AIMessageChunk, HumanMessage, ToolMessage
 from pydantic import BaseModel
 
+import auth
+import bootstrap
+import session_context
 from agent_run import kb_agent
-from config import CONTRACTS_DIR, LLM_MODEL_NAME
+from config import LLM_MODEL_NAME
 from contract_analyzer import REVIEW_DIMENSIONS, analyze_dimension
 from contract_kb import _KB_PROMPT, _format_context, llm
 from element_extractor import extract_elements
 from jobs import JobAbort, create_job, get_job, keepalive_all
-import session_context
+from storage import get_store
 from vector_store import add_file_to_kb, db_stats, get_retriever
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
 
 app = FastAPI(title="Contract AI · 本地化智能合同审查系统")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# 启动初始化（幂等）：预置演示账号 demo + 演示合同归户入库
+bootstrap.init_system()
 
 # Ollama 单模型串行：全局锁避免并发推理错乱
 MODEL_LOCK = threading.Lock()
@@ -48,6 +57,23 @@ def _try_lock() -> bool:
     return MODEL_LOCK.acquire(timeout=3.0)
 
 
+# ==================== 鉴权 ====================
+def _extract_token(request: Request) -> str:
+    """取请求 token：优先 Authorization: Bearer，其次 ?token=（SSE 用）。"""
+    h = request.headers.get("authorization", "")
+    if h.lower().startswith("bearer "):
+        return h[7:].strip()
+    return request.query_params.get("token", "") or request.headers.get("x-token", "")
+
+
+def current_user(request: Request) -> dict:
+    """FastAPI 依赖：解析当前登录用户，无效则 401。"""
+    user = auth.user_by_token(_extract_token(request))
+    if not user:
+        raise HTTPException(status_code=401, detail="未登录或登录已过期，请重新登录")
+    return user
+
+
 @app.middleware("http")
 async def _keepalive_middleware(request, call_next):
     """用户仍在发起请求 → 浏览器仍在使用 → 给后台任务续期（避免误中止）。"""
@@ -57,10 +83,10 @@ async def _keepalive_middleware(request, call_next):
 
 @app.middleware("http")
 async def _no_cache_static(request, call_next):
-    """页面与静态资源禁用缓存：改版后刷新即可看到最新版本（避免浏览器命中旧 HTML/JS/CSS）。"""
+    """页面与静态资源禁用缓存：改版后刷新即可看到最新版本。"""
     response = await call_next(request)
     path = request.url.path
-    if path.startswith("/static/") or path in ("/", "/kb", "/review", "/ingest"):
+    if path.startswith("/static/") or path in ("/", "/kb", "/review", "/ingest", "/login"):
         response.headers["Cache-Control"] = "no-cache"
     return response
 
@@ -79,11 +105,7 @@ async def sse_generator(worker):
     """
     通用 SSE 生成器：在后台线程运行 worker(send, stop)，
     worker 通过 send(type, payload) 推送事件，主线程逐条 yield。
-    worker 结束时自动补发 done 事件；异常自动补发 error 事件。
-
-    关键：客户端断开（刷新 / 关闭页面）时，本生成器被 asyncio 取消，
-    finally 中会置 stop 事件；worker 在每轮循环 / 每个 token 处检查
-    stop 即可及时中止推理，尽快释放 MODEL_LOCK，避免整站假死。
+    客户端断开时 finally 置 stop 事件，worker 及时中止并释放模型锁。
     """
     q: queue.Queue = queue.Queue()
     stop = threading.Event()
@@ -113,14 +135,14 @@ async def sse_generator(worker):
             try:
                 etype, payload = q.get_nowait()
             except queue.Empty:
-                await asyncio.sleep(0.03)  # 轮询间隔：让取消能被及时感知
+                await asyncio.sleep(0.03)
                 continue
             if etype == "__end__":
                 break
             yield _sse({"type": etype, "data": payload})
         yield _sse({"type": "done"})
     finally:
-        stop.set()  # 正常结束或客户端断开都会通知 worker 停止
+        stop.set()
 
 
 def sse_response(worker) -> StreamingResponse:
@@ -131,27 +153,14 @@ def sse_response(worker) -> StreamingResponse:
     )
 
 
-# ==================== 工具函数 ====================
-def _list_all_files() -> list:
-    """列出 contracts 与 uploads 两个目录的合同文件。"""
-    files = []
-    for d in (CONTRACTS_DIR, UPLOAD_DIR):
-        if os.path.isdir(d):
-            for f in sorted(os.listdir(d)):
-                if f.lower().endswith((".txt", ".pdf")):
-                    files.append({"name": f, "dir": os.path.basename(d)})
-    return files
-
-
-def _resolve_anywhere(name: str):
-    """在 contracts/uploads 目录定位文件，返回绝对路径或 None。"""
-    for d in (CONTRACTS_DIR, UPLOAD_DIR):
-        p = os.path.join(d, name)
-        if os.path.isfile(p):
-            return p
-    if os.path.isfile(name):
-        return os.path.abspath(name)
-    return None
+def _own_job(job_id: str, user: dict):
+    """取属于当前用户的任务；不存在/不属于返回 None。"""
+    job = get_job(job_id)
+    if not job:
+        return None
+    if job.owner and job.owner != user["username"]:
+        return None
+    return job
 
 
 # ==================== 页面路由 ====================
@@ -175,35 +184,87 @@ def page_ingest():
     return FileResponse(os.path.join(STATIC_DIR, "ingest.html"))
 
 
+@app.get("/login")
+def page_login():
+    return FileResponse(os.path.join(STATIC_DIR, "login.html"))
+
+
+# ==================== 认证接口 ====================
+class RegisterBody(BaseModel):
+    username: str
+    password: str
+    display_name: str = ""
+
+
+class LoginBody(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/auth/register")
+def api_register(body: RegisterBody):
+    """注册新用户（用户名唯一）；成功后自动登录，并把上传根目录遗留文件认领给新用户。"""
+    user = auth.register_user(body.username, body.password, body.display_name)
+    if not user:
+        raise HTTPException(status_code=400, detail="用户名已存在或用户名/密码不合法（至少 1 个字符）")
+    sess = auth.login(body.username, body.password)
+    try:
+        bootstrap.claim_root_orphans(user)
+    except Exception as e:  # noqa: BLE001
+        print(f"[register] 认领遗留文件失败（可忽略）：{e}")
+    return {"ok": True, **sess}
+
+
+@app.post("/api/auth/login")
+def api_login(body: LoginBody):
+    sess = auth.login(body.username, body.password)
+    if not sess:
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+    return {"ok": True, **sess}
+
+
+@app.post("/api/auth/logout")
+def api_logout(user: dict = Depends(current_user), request: Request = None):
+    auth.logout(_extract_token(request))
+    return {"ok": True}
+
+
+@app.get("/api/me")
+def api_me(user: dict = Depends(current_user)):
+    return {"username": user["username"], "display_name": user.get("display_name") or user["username"]}
+
+
 # ==================== 数据接口 ====================
 @app.get("/api/files")
-def api_files():
-    """合同清单 + 系统状态（各页面共用）。"""
+def api_files(user: dict = Depends(current_user)):
+    """当前用户的合同清单 + 系统状态。"""
+    store = get_store()
     return {
-        "files": _list_all_files(),
+        "username": user["username"],
+        "files": store.list_files(user["id"]),
         "model": LLM_MODEL_NAME,
-        "stats": db_stats(),
+        "stats": db_stats(owner=user["username"]),
     }
 
 
 # ==================== SSE 流式接口 ====================
 class KBQueryBody(BaseModel):
     question: str
-    top_k: int = 3  # 检索返回片段数（默认 top 3）
+    top_k: int = 3  # 检索返回片段数（固定 top 3）
     sources: list[str] = []  # 上下文合同范围（空 = 全部合同）
 
 
 @app.post("/api/kb/query")
-def api_kb_query(body: KBQueryBody):
-    """知识库 RAG 问答（纯检索 + 流式回答，带证据片段）。
-    - sources 非空时仅在这些合同文件内检索；空 = 全部合同。"""
+def api_kb_query(body: KBQueryBody, user: dict = Depends(current_user)):
+    """知识库 RAG 问答（仅检索当前用户合同库）。"""
 
     def worker(send, stop):
         if not _try_lock():
             send("error", {"message": _BUSY_MSG})
             return
         try:
-            retriever = get_retriever(body.top_k, sources=body.sources or None)
+            retriever = get_retriever(body.top_k, sources=body.sources or None,
+                                      owner=user["username"])
             docs = retriever.invoke(body.question)
             if not docs:
                 if body.sources:
@@ -211,7 +272,6 @@ def api_kb_query(body: KBQueryBody):
                 else:
                     send("message", {"text": "知识库未检索到相关合同内容，请先到「合同入库」页导入合同。"})
                 return
-            # ① 证据片段
             send("evidence", {
                 "items": [
                     {"index": i + 1,
@@ -220,7 +280,6 @@ def api_kb_query(body: KBQueryBody):
                     for i, d in enumerate(docs)
                 ]
             })
-            # ② 流式回答
             prompt = _KB_PROMPT.format(context=_format_context(docs), question=body.question)
             for chunk in llm.stream([HumanMessage(content=prompt)]):
                 if stop.is_set():
@@ -241,16 +300,15 @@ class ChatBody(BaseModel):
 
 
 @app.post("/api/chat")
-def api_chat(body: ChatBody):
-    """Agent 多轮对话（工具调用事件 + 流式回答）。
-    发送前把用户选定的上下文合同范围登记到该会话，Agent 检索工具据此限定范围。"""
+def api_chat(body: ChatBody, user: dict = Depends(current_user)):
+    """Agent 多轮对话：登记会话的归属用户与合同范围，检索工具据此隔离。"""
 
     def worker(send, stop):
         if not _try_lock():
             send("error", {"message": _BUSY_MSG})
             return
         try:
-            # 登记该会话的上下文合同范围（空 = 全部），供 Agent 检索工具读取
+            session_context.set_owner(body.thread_id, user["username"])
             session_context.set_sources(body.thread_id, body.sources or None)
             tool_names: dict = {}
             for chunk, metadata in kb_agent.stream(
@@ -260,7 +318,6 @@ def api_chat(body: ChatBody):
             ):
                 if stop.is_set():
                     return
-                # 工具调用决策
                 tcc = getattr(chunk, "tool_call_chunks", None)
                 if tcc:
                     for tc in tcc:
@@ -269,7 +326,6 @@ def api_chat(body: ChatBody):
                         if piece and idx not in tool_names:
                             tool_names[idx] = piece
                             send("tool_call", {"name": piece})
-                # 文本 / 工具结果
                 text = chunk.content or ""
                 if isinstance(chunk, AIMessageChunk):
                     if text:
@@ -288,7 +344,7 @@ class FileBody(BaseModel):
 
 # ==================== 后台任务（Job）：跨页面不中断 ====================
 def _wait_model_lock(job):
-    """后台任务等待模型锁：等待期间若任务应停止（中止/用户离开）则退出返回 False。"""
+    """后台任务等待模型锁：等待期间若任务应停止则退出返回 False。"""
     while True:
         if MODEL_LOCK.acquire(timeout=1.0):
             return True
@@ -297,16 +353,16 @@ def _wait_model_lock(job):
 
 
 def run_review_job(job):
-    """合同 8 维度审查任务体：逐维度写入 job 状态，任意页面可订阅。"""
+    """合同 8 维度审查任务体（限定在任务归属用户的合同库内）。"""
     if not _wait_model_lock(job):
         return
     try:
-        path = _resolve_anywhere(job.filename)
+        path = bootstrap.resolve_user_file(job.owner, job.filename)
         if not path:
             job.status = "error"
             job.error = f"未找到合同文件：{job.filename}"
             return
-        add_file_to_kb(path)  # 确保已入库（幂等）
+        add_file_to_kb(path, owner=job.owner)  # 确保已入库（幂等）
         job.total = len(REVIEW_DIMENSIONS)
         done_n = len(job.results)  # 断点续跑：跳过已完成的维度
         for i, dim in enumerate(REVIEW_DIMENSIONS, 1):
@@ -322,7 +378,7 @@ def run_review_job(job):
                     raise JobAbort()
 
             result = analyze_dimension(
-                os.path.basename(path), dim, stream=False, emit=emit,
+                os.path.basename(path), dim, stream=False, emit=emit, owner=job.owner,
             )
             job.results.append(result)
     finally:
@@ -330,11 +386,11 @@ def run_review_job(job):
 
 
 def run_extract_job(job):
-    """合同要素抽取任务体。"""
+    """合同要素抽取任务体（限定在任务归属用户的合同库内）。"""
     if not _wait_model_lock(job):
         return
     try:
-        path = _resolve_anywhere(job.filename)
+        path = bootstrap.resolve_user_file(job.owner, job.filename)
         if not path:
             job.status = "error"
             job.error = f"未找到合同文件：{job.filename}"
@@ -355,12 +411,11 @@ def run_extract_job(job):
 
 
 @app.post("/api/analyze")
-def api_analyze(body: FileBody):
-    """提交合同 8 维度审查任务：立即返回 job_id，进度经 /api/jobs/<id>/stream 订阅。"""
-    path = _resolve_anywhere(body.filename)
-    if not path:
-        raise HTTPException(status_code=404, detail=f"未找到合同文件：{body.filename}")
-    job = create_job("review", body.filename, run_review_job)
+def api_analyze(body: FileBody, user: dict = Depends(current_user)):
+    """提交合同 8 维度审查任务：立即返回 job_id。"""
+    if not bootstrap.resolve_user_file(user["username"], body.filename):
+        raise HTTPException(status_code=404, detail=f"你的合同库中不存在文件：{body.filename}")
+    job = create_job("review", body.filename, run_review_job, owner=user["username"])
     return {
         "ok": True,
         "job_id": job.id,
@@ -370,66 +425,65 @@ def api_analyze(body: FileBody):
 
 
 @app.post("/api/extract")
-def api_extract(body: FileBody):
+def api_extract(body: FileBody, user: dict = Depends(current_user)):
     """提交合同要素抽取任务：立即返回 job_id。"""
-    path = _resolve_anywhere(body.filename)
-    if not path:
-        raise HTTPException(status_code=404, detail=f"未找到合同文件：{body.filename}")
-    job = create_job("extract", body.filename, run_extract_job)
+    if not bootstrap.resolve_user_file(user["username"], body.filename):
+        raise HTTPException(status_code=404, detail=f"你的合同库中不存在文件：{body.filename}")
+    job = create_job("extract", body.filename, run_extract_job, owner=user["username"])
     return {"ok": True, "job_id": job.id, "filename": body.filename}
 
 
+def _own_or_404(job_id: str, user: dict):
+    job = _own_job(job_id, user)
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在或无权访问")
+    return job
+
+
 @app.get("/api/jobs/{job_id}/status")
-def api_job_status(job_id: str):
-    """查询任务状态（页面刷新 / 重新打开时恢复进度用）。"""
+def api_job_status(job_id: str, user: dict = Depends(current_user)):
+    """查询任务状态（页面刷新 / 重新打开时恢复进度用）。不存在/无权访问返回 exists=false。"""
     job = get_job(job_id)
     if not job:
+        return {"exists": False}
+    if job.owner and job.owner != user["username"]:
         return {"exists": False}
     return {"exists": True, **job.snapshot()}
 
 
 @app.post("/api/jobs/{job_id}/leave")
-def api_job_leave(job_id: str):
+def api_job_leave(job_id: str, user: dict = Depends(current_user)):
     """页面离开时上报（sendBeacon）：后台由此重算「离开超时」。"""
-    job = get_job(job_id)
-    if job:
-        job.touch()
+    job = _own_or_404(job_id, user)
+    job.touch()
     return {"ok": True}
 
 
 @app.post("/api/jobs/{job_id}/abort")
-def api_job_abort(job_id: str):
+def api_job_abort(job_id: str, user: dict = Depends(current_user)):
     """彻底终止后台任务（不可恢复）。"""
-    job = get_job(job_id)
-    if job:
-        job.abort("已手动终止")
+    _own_or_404(job_id, user).abort("已手动终止")
     return {"ok": True}
 
 
 @app.post("/api/jobs/{job_id}/pause")
-def api_job_pause(job_id: str):
+def api_job_pause(job_id: str, user: dict = Depends(current_user)):
     """暂停任务（保留进度，可继续）。"""
-    job = get_job(job_id)
-    if job:
-        job.pause()
+    _own_or_404(job_id, user).pause()
     return {"ok": True}
 
 
 @app.post("/api/jobs/{job_id}/resume")
-def api_job_resume(job_id: str):
+def api_job_resume(job_id: str, user: dict = Depends(current_user)):
     """从暂停处继续任务。"""
-    job = get_job(job_id)
-    if job:
-        job.resume()
+    _own_or_404(job_id, user).resume()
     return {"ok": True}
 
 
 @app.get("/api/jobs/{job_id}/stream")
-async def api_job_stream(job_id: str):
+async def api_job_stream(job_id: str, user: dict = Depends(current_user)):
     """订阅任务进度（SSE）。支持多端同时订阅；单个页面断开不影响任务继续。"""
-    job = get_job(job_id)
-    if not job:
-        return JSONResponse(status_code=404, content={"detail": "任务不存在或已过期"})
+    job = _own_or_404(job_id, user)
 
     async def gen():
         job.attach()
@@ -472,34 +526,40 @@ async def api_job_stream(job_id: str):
 
 # ==================== 上传入库 ====================
 @app.post("/api/ingest")
-async def api_ingest(file: UploadFile = File(...)):
-    """上传合同文件并入库。"""
+async def api_ingest(file: UploadFile = File(...), user: dict = Depends(current_user)):
+    """上传合同文件到当前用户目录并入库（归该用户名下）。"""
     name = file.filename or "contract.txt"
     ext = os.path.splitext(name)[1].lower()
     if ext not in (".txt", ".pdf"):
         raise HTTPException(status_code=400, detail="仅支持 txt / pdf 格式")
     safe = os.path.basename(name.replace("\\", "/")).replace("/", "_")
+
+    store = get_store()
+    user_dir = bootstrap.ensure_user_dir(user["username"])
+    # 与用户库内已有文件重名时自动加序号，避免覆盖
+    final_name, counter = safe, 1
     base, e = os.path.splitext(safe)
-    dest = os.path.join(UPLOAD_DIR, safe)
-    counter = 1
-    while os.path.exists(dest):
-        dest = os.path.join(UPLOAD_DIR, f"{base}_{counter}{e}")
+    while store.get_file(user["id"], final_name) or os.path.exists(os.path.join(user_dir, final_name)):
+        final_name = f"{base}_{counter}{e}"
         counter += 1
 
+    dest = os.path.join(user_dir, final_name)
     content = await file.read()
     with open(dest, "wb") as f:
         f.write(content)
 
-    added = add_file_to_kb(dest)
-    return {"ok": True, "saved": os.path.basename(dest), "added_chunks": added}
+    store.add_file(user["id"], final_name, "uploads", len(content))
+    added = add_file_to_kb(dest, owner=user["username"])
+    return {"ok": True, "saved": final_name, "added_chunks": added}
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    print("=" * 56)
-    print("  Contract AI · 本地化智能合同审查系统（网页版）")
+    print("=" * 60)
+    print("  Contract AI · 本地化智能合同审查系统（网页版 · 用户版）")
     print(f"  模型：{LLM_MODEL_NAME}   服务：http://localhost:8000")
+    print(f"  预置演示账号：demo / demo123（含保密协议等演示合同）")
     print("  Ctrl+C 退出")
-    print("=" * 56)
+    print("=" * 60)
     uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")

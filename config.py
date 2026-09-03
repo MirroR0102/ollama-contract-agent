@@ -99,3 +99,17 @@ REVIEW_DIMENSIONS = [
 
 # 单次送入大模型的合同上下文上限（字符），超出自动截断防止超长
 MAX_CONTEXT_CHARS = 8000
+
+# ================== 数据库（用户系统与合同库归属） ==================
+# DB_ENGINE: sqlite（本地文件，免配置，默认）/ mysql（需填下方连接信息）
+DB_ENGINE = os.getenv("DB_ENGINE", "sqlite").lower()
+DB_PATH = os.getenv("DB_PATH", "./contract_ai.db")    # sqlite 数据库文件
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")           # mysql 连接信息
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_NAME = os.getenv("DB_NAME", "contract_ai")
+
+# 预置演示账号：存放 contracts 演示库（保密协议/劳动合同/采购合同）的测试用户
+DEMO_USERNAME = os.getenv("DEMO_USERNAME", "demo")
+DEMO_PASSWORD = os.getenv("DEMO_PASSWORD", "demo123")

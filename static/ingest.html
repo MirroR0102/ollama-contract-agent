@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>合同入库 · Contract AI</title>
-<link rel="stylesheet" href="/static/style.css?v=2">
+<link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
   <header class="navbar">
@@ -42,9 +42,9 @@
     </div>
   </main>
 
-<script src="/static/main.js?v=2"></script>
+<script src="/static/main.js?v=3"></script>
 <script>
-initNav('ingest');
+initPage('ingest');
 
 const dropZone = document.getElementById('dropZone');
 const fileInput = document.getElementById('fileInput');
@@ -81,9 +81,7 @@ uploadBtn.addEventListener('click', async () => {
   const fd = new FormData();
   fd.append('file', pickedFile);
   try {
-    const r = await fetch('/api/ingest', { method: 'POST', body: fd });
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.detail || '上传失败');
+    const j = await apiJSON('/api/ingest', { method: 'POST', body: fd });
     uploadResult.classList.remove('hidden');
     uploadResult.style.background = '#ecfdf5';
     uploadResult.style.color = '#065f46';
@@ -102,8 +100,7 @@ uploadBtn.addEventListener('click', async () => {
 
 async function loadFiles() {
   try {
-    const r = await fetch('/api/files');
-    const j = await r.json();
+    const j = await apiJSON('/api/files');
     statsTag.textContent = '模型：' + j.model + ' ｜ 向量库切片：' + (j.stats?.total_chunks ?? 0);
     fileList.innerHTML = '';
     if (!j.files || !j.files.length) { emptyFiles.classList.remove('hidden'); return; }

@@ -18,14 +18,18 @@
 | ⑤ 记忆 Agent ⭐ | LangGraph 多轮对话记忆，自动决策调用 4 个工具 | Agent / LangGraph / 短期上下文记忆 |
 | ⑥ 向量库管理 | 状态统计 / 清空 | Chroma 管理 |
 | ⑦ 网页版 ⭐ | FastAPI 封装全部能力 + SSE 流式，浏览器四页面交互 | 服务化封装 / 流式接口 |
+| ⑧ 用户系统 ⭐ | 注册/登录 + MySQL 合同库归属 + Chroma owner 多租户隔离，各账号合同库完全独立 | 数据库设计 / 认证 / 权限隔离 |
 
 ## 二、目录结构
 
 ```
 ollama_contract_agent/
-├── .env / .env.example      # Ollama 地址与模型配置
+├── .env / .env.example      # Ollama / MySQL 配置（.env 含密码不入库）
 ├── requirements.txt         # 依赖清单
-├── config.py                # 全局配置（模型/向量库/审查维度）
+├── config.py                # 全局配置（模型/向量库/审查维度/数据库）
+├── storage.py               # 存储层：MySQL / SQLite 双后端（用户 + 合同归属）
+├── auth.py                  # 用户认证：PBKDF2 密码哈希 + token 会话
+├── bootstrap.py             # 启动初始化：预置 demo 账号、演示合同归户入库
 ├── embedding_client.py      # 本地嵌入模型封装（OllamaEmbeddings）
 ├── document_loader.py       # 文档加载与智能分块（txt/pdf）
 ├── vector_store.py          # Chroma 向量库：入库/去重/检索/统计/清空
@@ -36,7 +40,7 @@ ollama_contract_agent/
 ├── agent_run.py             # LangGraph 记忆 Agent 交互对话
 ├── main.py                  # 系统菜单入口（答辩演示用）
 ├── app.py                   # 网页版后端（FastAPI + SSE 流式接口）
-├── static/                  # 网页前端（kb/对话/审查/入库 四页面）
+├── static/                  # 网页前端（登录 + kb/对话/审查/入库 五页面）
 ├── uploads/                 # 网页上传的合同（不入库 git）
 ├── WEB_PLAN.md              # 网页版开发方案
 └── contracts/               # 演示合同文档（3 份样例，可自行替换）
@@ -78,7 +82,8 @@ pip install -r requirements.txt
 ```bash
 # 方式零：网页版（推荐答辩演示，浏览器访问 http://localhost:8000）
 python app.py
-# 页面：/kb 知识库问答  / 智能体对话  /review 合同审查  /ingest 合同入库
+# 页面：/login 登录注册（默认演示账号 demo/demo123）→ /kb 知识库问答  / 智能体对话  /review 合同审查  /ingest 合同入库
+# 首次启动自动建库并预置演示账号；注册新账号后上传的合同自动归属该账号
 
 # 方式一：菜单式全流程（命令行演示）
 python main.py
@@ -111,6 +116,8 @@ python element_extractor.py    # 测试要素抽取
 - **无幻觉保障**：审查/问答均强制"先检索原文片段，再让模型基于片段作答"，并把证据原文一并输出，可从机制上说明如何抑制幻觉。
 - **定向检索防串库**：`contract_analyzer` 审查时按 `source` 元数据过滤向量库，保证只分析目标合同，不会混入其他合同内容。
 - **多轮记忆**：`MemorySaver` + `thread_id` 实现会话级短期上下文记忆，隔离不同用户的对话。
+- **多租户用户隔离**：注册/登录（token 会话）+ 数据库记录每份合同归属 + Chroma 切片按 owner 过滤；
+  检索/审查/抽取/上传全部限定当前账号，不同账号的合同库**完全不互通**（含越权 404 防护）。
 - **可扩展架构**：模型全走 `.env` 配置；新增工具只需在 `tools.py` 加 `@tool` 函数并加入 `ALL_TOOLS`；后续可封装 FastAPI、接入 Web 界面。
 
 ## 六、校验自查（对照课程标准）
