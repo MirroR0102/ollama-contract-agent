@@ -15,6 +15,19 @@ import time
 import uuid
 
 
+def _friendly_error(msg: str) -> str:
+    """把 Ollama / 推理层常见英文报错映射为可操作的中文提示。"""
+    if "Failed to connect to Ollama" in msg or "connect to Ollama" in msg:
+        return ("无法连接本地 Ollama 服务：Ollama 可能正在重启或已退出。"
+                "请确认 Ollama 已启动后重试；若仍报错，请重启网页服务（python app.py）。")
+    if "llama-server process has terminated" in msg or "CUDA error" in msg:
+        return ("本地模型推理进程异常退出（CUDA / 显存相关）。"
+                "请重启 Ollama 后重试；若频繁出现，建议更新显卡驱动或减小模型上下文。")
+    if "out of memory" in msg.lower() or "allocate" in msg.lower():
+        return "显存不足，无法完成推理。请关闭其他占用显存的程序后重试，或减小模型上下文长度。"
+    return msg
+
+
 class JobAbort(Exception):
     """任务被判定为「用户已离开」而主动中止。"""
 
@@ -58,7 +71,7 @@ class Job:
         except Exception as e:  # noqa: BLE001
             with self._lock:
                 self.status = "error"
-                self.error = f"{type(e).__name__}: {e}"
+                self.error = _friendly_error(f"{type(e).__name__}: {e}")
 
     def abort(self, reason: str = "任务已中止"):
         """彻底终止任务（不再可恢复）。"""
