@@ -7,9 +7,12 @@ tools.py —— 自定义工具集（供 Agent 自主调用）
   3. extract_contract_elements  合同关键要素结构化抽取
   4. list_contract_files        查看库内可用合同清单
 """
+import os
+
 from langchain.tools import tool
 from langchain_core.runnables import RunnableConfig
 
+import bootstrap
 import session_context
 from contract_analyzer import analyze_contract, _list_contract_files
 from contract_kb import kb_query
@@ -24,6 +27,27 @@ def _thread_ctx(config: RunnableConfig):
         return None, None
     return (session_context.get_owner(thread_id),
             session_context.get_sources(thread_id))
+
+
+def _owner_files(owner: str) -> list:
+    """当前账户合同库的文件名清单（供“未找到”时的友好提示）。"""
+    if not owner:
+        return []
+    try:
+        u = get_store().get_user_by_name(owner)
+        return [f["name"] for f in get_store().list_files(u["id"])]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _resolve_agent_path(contract_name: str, owner: str):
+    """解析当前会话用户合同库内的文件绝对路径。
+    - owner 非空（网页登录场景）：在 uploads/<owner>/ 下解析（找不到返回 None）
+    - owner 为空（命令行场景）：原样返回名称，交给 analyze/extract 的 contracts/ 逻辑
+    """
+    if owner:
+        return bootstrap.resolve_user_file(owner, contract_name)
+    return contract_name
 
 
 @tool
@@ -50,21 +74,31 @@ def search_contract_knowledge(query: str, config: RunnableConfig) -> str:
 
 
 @tool
-def analyze_contract_tool(contract_name: str, focus_dimensions: str = "") -> str:
+def analyze_contract_tool(contract_name: str, focus_dimensions: str = "",
+                          config: RunnableConfig = None) -> str:
     """
-    对指定合同执行多维度智能风险审查，输出风险等级与修改建议。
-    当用户要求“审查/分析/检查某合同的风险”时调用。
+    对当前账户合同库中的指定合同执行多维度智能风险审查，输出风险等级与修改建议。
+    当用户要求“审查/分析/检查某合同的风险”时必须调用本工具。
+    如不确定合同文件名，请先调用 list_contract_files_tool 获取当前可用合同清单。
     Args:
-        contract_name: 合同文件名（如：采购合同.txt，可只写部分名称）
+        contract_name: 当前账户合同库中的合同文件名（如：保密协议_sample.txt，可只写部分名称）
         focus_dimensions: 重点关注的风险维度，逗号分隔，可留空（默认全部维度）
     """
+    owner, _sources = _thread_ctx(config)
+    path = _resolve_agent_path(contract_name, owner)
+    if path is None:
+        files = _owner_files(owner)
+        hint = "\n".join(f"- {f}" for f in files) if files else "（空）"
+        return (f"你的合同库中未找到《{contract_name}》。当前可用合同：\n{hint}\n"
+                f"请用准确的合同文件名重试。")
     dims = [d.strip() for d in focus_dimensions.split(",") if d.strip()] or None
     try:
         # 被 Agent 调用时静默执行（stream=False），结果由 Agent 汇总返回
-        results = analyze_contract(contract_name, dims=dims, progress=False, stream=False)
+        results = analyze_contract(path, dims=dims, progress=False, stream=False,
+                                   owner=owner)
     except Exception as e:  # noqa: BLE001
         return f"审查失败：{e}"
-    lines = [f"《{contract_name}》审查结果："]
+    lines = [f"《{os.path.basename(path)}》审查结果："]
     for r in results:
         lines.append(
             f"- 【{r.get('dimension', '')}】风险:{r.get('risk_level', '未知')} | "
@@ -74,19 +108,28 @@ def analyze_contract_tool(contract_name: str, focus_dimensions: str = "") -> str
 
 
 @tool
-def extract_contract_elements_tool(contract_name: str) -> str:
+def extract_contract_elements_tool(contract_name: str,
+                                   config: RunnableConfig = None) -> str:
     """
-    抽取合同的关键要素（类型/当事人/金额/期限/日期/争议解决等），输出结构化信息。
-    当用户要求“总结/提取某合同的关键信息、当事人、金额、期限”时调用。
+    抽取当前账户合同库中合同的关键要素（类型/当事人/金额/期限/日期/争议解决等），
+    输出结构化信息。当用户要求“总结/提取某合同的关键信息、当事人、金额、期限”时调用。
+    如不确定合同文件名，请先调用 list_contract_files_tool 获取当前可用合同清单。
     Args:
-        contract_name: 合同文件名（可只写部分名称）
+        contract_name: 当前账户合同库中的合同文件名（如：保密协议_sample.txt，可只写部分名称）
     """
+    owner, _sources = _thread_ctx(config)
+    path = _resolve_agent_path(contract_name, owner)
+    if path is None:
+        files = _owner_files(owner)
+        hint = "\n".join(f"- {f}" for f in files) if files else "（空）"
+        return (f"你的合同库中未找到《{contract_name}》。当前可用合同：\n{hint}\n"
+                f"请用准确的合同文件名重试。")
     try:
         # 被 Agent 调用时静默执行（stream=False）
-        data = extract_elements(contract_name, stream=False)
+        data = extract_elements(path, stream=False)
     except Exception as e:  # noqa: BLE001
         return f"抽取失败：{e}"
-    lines = [f"《{contract_name}》关键要素："]
+    lines = [f"《{os.path.basename(path)}》关键要素："]
     for k, v in data.items():
         if v:
             lines.append(f"- {k}: {v}")
