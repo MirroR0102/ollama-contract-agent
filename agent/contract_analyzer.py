@@ -12,10 +12,10 @@ import re
 
 from langchain_core.messages import HumanMessage
 
-from config import CONTRACTS_DIR, REVIEW_DIMENSIONS
-from contract_kb import stream_generate
-from ollama_conn import retry_emb_call
-from vector_store import add_file_to_kb, get_db
+from agent.contract_kb import stream_generate
+from core.config import CONTRACTS_DIR, REVIEW_DIMENSIONS
+from core.ollama_conn import retry_emb_call
+from store.vector_store import add_file_to_kb, get_db
 
 # 单维度检索片段数（答辩实测：top_k=2 在万字合同中可能漏检关键条款，
 # 导致「其实有约定却被判约定空白」的误报；调到 4 后命中率显著提升）

@@ -8,9 +8,9 @@ import time
 
 from langchain_core.messages import HumanMessage
 
-from ollama_conn import (BASE_DELAY, MAX_RETRY, get_llm, is_conn_error,
-                         reset_llm, retry_emb_call)
-from vector_store import get_retriever
+from core.ollama_conn import (BASE_DELAY, MAX_RETRY, get_llm, is_conn_error,
+                              reset_llm, retry_emb_call)
+from store.vector_store import get_retriever
 
 # 无幻觉提示词模板（答辩重点：对比“直接问模型” vs “RAG 问答”）
 _KB_PROMPT = """你是企业合同知识库问答助手，必须严格遵守：

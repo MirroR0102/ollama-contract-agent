@@ -13,12 +13,12 @@ bootstrap.py —— 系统初始化与用户文件目录工具
 import os
 import shutil
 
-import auth
-from config import CONTRACTS_DIR, DEMO_PASSWORD, DEMO_USERNAME
-from storage import get_store
-from vector_store import add_file_to_kb, clear_db
+from core.config import CONTRACTS_DIR, DEMO_PASSWORD, DEMO_USERNAME
+from store import auth
+from store.storage import get_store
+from store.vector_store import add_file_to_kb, clear_db
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UPLOAD_ROOT = os.path.join(BASE_DIR, "uploads")
 
 # storage.meta 中的标记：完成过「用户体系预置」
@@ -70,11 +70,13 @@ def init_system() -> None:
     # 2) 首次切换用户体系：清空旧的「无归属」向量数据，按 owner 重建，保证隔离干净
     clear_db()
 
-    # 3) 登记到 storage + 按 owner 入库
+    # 3) 登记到 storage（含合同域 contract_id）+ 按域入库
     for fn in copied:
         p = os.path.join(demo_dir, fn)
-        store.add_file(demo["id"], fn, "contracts", os.path.getsize(p))
-        add_file_to_kb(p, owner=DEMO_USERNAME)
+        rec = store.add_contract(demo["id"], fn, fn, "contracts",
+                                 os.path.getsize(p), note="演示合同")
+        add_file_to_kb(p, owner=DEMO_USERNAME,
+                       contract_id=rec["id"] if rec else "")
 
     store.set_meta(SEED_KEY, "1")
     print(f"[init] 预置演示账号 {DEMO_USERNAME} 完成：{len(copied)} 份演示合同已归入并入库")
@@ -103,8 +105,10 @@ def claim_root_orphans(user) -> int:
         try:
             if not os.path.exists(dst):
                 os.replace(src, dst)
-            store.add_file(user["id"], fn, "uploads", os.path.getsize(dst))
-            add_file_to_kb(dst, owner=uname)
+            rec = store.add_contract(user["id"], fn, fn, "uploads",
+                                     os.path.getsize(dst), note="历史认领文件")
+            add_file_to_kb(dst, owner=uname,
+                           contract_id=rec["id"] if rec else "")
             claimed += 1
         except Exception as e:  # noqa: BLE001
             print(f"[claim] 认领 {fn} 失败：{e}")

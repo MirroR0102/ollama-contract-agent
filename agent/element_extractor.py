@@ -9,10 +9,10 @@ import json
 import os
 import re
 
-from config import CONTRACTS_DIR, MAX_CONTEXT_CHARS
-from contract_analyzer import _resolve_file
-from contract_kb import stream_generate
-from document_loader import read_plain_text
+from agent.contract_analyzer import _resolve_file
+from agent.contract_kb import stream_generate
+from core.config import CONTRACTS_DIR, MAX_CONTEXT_CHARS
+from store.document_loader import read_plain_text
 
 _EXTRACT_PROMPT = """你是企业合同信息抽取助手。请阅读下方【合同原文】，抽取关键要素。
 规则：只依据原文，原文没有的字段填 null，不要猜测。
@@ -36,14 +36,16 @@ _EXTRACT_PROMPT = """你是企业合同信息抽取助手。请阅读下方【�
 """
 
 
-def extract_elements(name: str, stream: bool = True, emit=None) -> dict:
+def extract_elements(name: str, stream: bool = True, emit=None, text: str = None) -> dict:
     """
     抽取一份合同的关键要素（流式生成），返回结构化 dict。
     - stream=True：边生成边打印 JSON（打字机效果）；被 Agent 工具调用时传 False 静默。
     - emit：可选回调，逐 token 转发（Web 端 SSE 用）
+    - text：可选，外部已读好的合同全文（巡检批量场景避免重复读文件）；缺省自动读文件
     """
-    file_path = _resolve_file(name)
-    text = read_plain_text(file_path)
+    if text is None:
+        file_path = _resolve_file(name)
+        text = read_plain_text(file_path)
     # 超长截断，防止超出模型上下文
     if len(text) > MAX_CONTEXT_CHARS:
         print(f"[提示] 合同较长，已截取前 {MAX_CONTEXT_CHARS} 字符进行分析")

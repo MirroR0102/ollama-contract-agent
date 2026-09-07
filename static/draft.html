@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 起草 · Contract AI</title>
+<link rel="stylesheet" href="/static/style.css?v=4">
+</head>
+<body>
+  <header class="navbar">
+    <div class="brand"><span class="logo">⚖️</span> Contract AI</div>
+    <nav>
+      <a href="/kb" data-page="kb">📚 知识库问答</a>
+      <a href="/" data-page="chat">🤖 智能体对话</a>
+      <a href="/draft" data-page="draft">📝 AI 起草</a>
+      <a href="/review" data-page="review">📋 合同审查</a>
+      <a href="/inspect" data-page="inspect">📊 合同巡检</a>
+      <a href="/ingest" data-page="ingest">📤 合同入库</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <div class="card">
+      <div class="page-title">📝 AI 起草 · 合同起草智能体</div>
+      <div class="page-sub">用一句话描述你要的合同（类型 / 当事人 / 金额 / 期限 / 违约责任等），智能体流式起草一份结构完整的合同草案；可选「参考蓝本」——参考你库内某份已入库合同的结构与行文风格来起草。</div>
+
+      <div class="draft-ref">
+        <label for="refSelect">参考蓝本合同（可选）：</label>
+        <select id="refSelect" style="flex:1;max-width:340px;">
+          <option value="">— 不参考，按通用规范起草 —</option>
+        </select>
+        <span class="ctx-hint">选择后智能体将按其条款结构与行文风格起草</span>
+      </div>
+
+      <div class="input-row" style="margin-top:8px;">
+        <textarea id="reqInput" rows="4" placeholder="例如：软件开发委托合同：甲方委托乙方开发一套会员管理系统，开发费 50 万元，分三期支付（签约付 30%、交付验收付 40%、验收后 30 日付 30%），工期 90 天，质保 12 个月，违约金按合同总价 0.2%/日，知识产权归甲方，管辖甲方所在地法院。"></textarea>
+        <button class="btn btn-primary" id="genBtn" style="align-self:flex-end;">生成草案</button>
+      </div>
+
+      <div class="draft-actions">
+        <button class="btn btn-ghost" id="rewriteBtn">🔄 换一种写法</button>
+        <button class="btn btn-ghost" id="copyBtn">📋 复制全文</button>
+        <button class="btn btn-ghost" id="saveBtn" title="存进合同库后即可被知识库问答/智能体对话/合同审查使用">💾 存入合同库</button>
+        <span class="draft-export-group">
+          <button class="btn btn-ghost export-btn" data-fmt="txt">⬇️ 导出 TXT</button>
+          <button class="btn btn-ghost export-btn" data-fmt="docx">⬇️ 导出 DOCX</button>
+          <button class="btn btn-ghost export-btn" data-fmt="pdf">⬇️ 导出 PDF</button>
+        </span>
+        <button class="btn btn-ghost" id="clearBtn">🗑 清空</button>
+        <span class="ctx-hint">📝 起草智能体 · 草稿可复制或导出为文档</span>
+      </div>
+
+      <div class="kb-stage hidden" id="draftStage"></div>
+
+      <div class="result-box" id="draftBox">
+        <div class="empty-tip" id="emptyTip">填写起草需求后点击「生成草案」，智能体会流式输出合同草稿</div>
+      </div>
+    </div>
+  </main>
+
+<script src="/static/main.js?v=4"></script>
+<script>
+initPage('draft');
+
+const genBtn = document.getElementById('genBtn');
+const rewriteBtn = document.getElementById('rewriteBtn');
+const copyBtn = document.getElementById('copyBtn');
+const saveBtn = document.getElementById('saveBtn');
+const clearBtn = document.getElementById('clearBtn');
+const reqInput = document.getElementById('reqInput');
+const refSelect = document.getElementById('refSelect');
+const draftBox = document.getElementById('draftBox');
+const emptyTip = document.getElementById('emptyTip');
+const draftStage = document.getElementById('draftStage');
+
+// 参考合同下拉
+apiJSON('/api/files').then(j => {
+  const files = (j && j.files) || [];
+  refSelect.innerHTML = '<option value="">— 不参考，按通用规范起草 —</option>' +
+    files.map(f => `<option value="${esc(f.name)}">${esc(f.name)}</option>`).join('');
+}).catch(() => {});
+
+let draftFull = '';
+let drafting = false;
+
+function setStage(t) { draftStage.classList.remove('hidden'); draftStage.textContent = t; }
+function hideStage() { draftStage.classList.add('hidden'); draftStage.textContent = ''; }
+
+// 页面/容器自动跟随流式输出滚动到底（仅当用户处于底部附近时，不打扰往回看）
+function draftNearBottom() {
+  const d = document.documentElement;
+  return (window.innerHeight + window.scrollY) >= (d.scrollHeight - 140);
+}
+function scrollDraftFollow() {
+  const box = document.getElementById('draftBox');
+  if (box && box.scrollHeight > box.clientHeight + 4) box.scrollTop = box.scrollHeight;
+  if (draftNearBottom()) {
+    window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'auto' });
+  }
+}
+
+function renderDraft() {
+  // 草稿区：代码块会保留，故直接渲染成 md（含 pre）
+  draftBox.innerHTML = '<div class="draft-out">' + mdRender(draftFull) + '</div>';
+  if (!draftFull.trim()) {
+    emptyTip.classList.remove('hidden');
+  } else {
+    emptyTip.classList.add('hidden');
+  }
+  scrollDraftFollow();
+}
+
+function setBusy(busy) {
+  drafting = busy;
+  genBtn.disabled = busy;
+  rewriteBtn.disabled = busy || !draftFull.trim();
+  reqInput.disabled = busy;
+  refSelect.disabled = busy;
+  saveBtn.disabled = busy || !draftFull.trim();
+  document.querySelectorAll('.export-btn').forEach(b => { b.disabled = busy; });
+  if (!busy) { hideStage(); }
+}
+
+async function doDraft(rewrite) {
+  const requirement = reqInput.value.trim();
+  if (!requirement) { reqInput.focus(); return; }
+  if (drafting) return;
+  setBusy(true);
+  if (rewrite) draftFull = ''; else draftFull = '';
+  draftBox.innerHTML = '';
+  emptyTip.classList.add('hidden');
+  setStage(rewrite ? '🔁 起草智能体正在换一种写法重新起草…' : '📝 起草智能体正在生成合同草案…');
+  await streamSSE('/api/draft', {
+    requirement, reference: refSelect.value || '', rewrite: !!rewrite,
+  }, {
+    onEvent(type, payload) {
+      if (type === 'token') { draftFull += payload.text || ''; renderDraft(); }
+    },
+    onDone() { finishDraft(); },
+    onError(msg) { draftFull += '\n\n❌ ' + msg; renderDraft(); finishDraft(); }
+  });
+}
+
+function finishDraft() {
+  setBusy(false);
+  hideStage();
+  copyBtn.disabled = !draftFull.trim();
+}
+
+async function copyAll() {
+  if (!draftFull.trim()) return;
+  try {
+    await navigator.clipboard.writeText(draftFull.trim());
+    const old = copyBtn.textContent;
+    copyBtn.textContent = '✅ 已复制';
+    setTimeout(() => { copyBtn.textContent = old; }, 1500);
+  } catch (e) {
+    copyBtn.textContent = '❌ 复制失败';
+    setTimeout(() => { copyBtn.textContent = '📋 复制全文'; }, 1500);
+  }
+}
+
+// 一键存入合同库（起草 → 入库 → 可被检索/审查的闭环）
+async function saveDraft() {
+  const text = draftFull.trim();
+  if (!text) return;
+  const title = (reqInput.value || '').trim().slice(0, 30) || 'AI起草合同';
+  saveBtn.disabled = true;
+  const old = saveBtn.textContent;
+  saveBtn.textContent = '⏳ 入库中…';
+  try {
+    const j = await apiJSON('/api/draft/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, title }),
+    });
+    if (j && j.ok) {
+      saveBtn.textContent = '✅ 已入库（' + (j.chunks || 0) + ' 切片）';
+      setTimeout(() => { saveBtn.textContent = old; }, 2500);
+    }
+  } catch (e) {
+    alert('入库失败：' + ((e && (e.detail || e.message)) || '未知错误'));
+    saveBtn.textContent = old;
+    saveBtn.disabled = false;
+  }
+}
+
+// 导出草稿：txt / docx / pdf（后端生成文件，前端触发下载）
+async function exportFile(fmt) {
+  const text = draftFull.trim();
+  if (!text) return;
+  const btn = document.querySelector('.export-btn[data-fmt="' + fmt + '"]');
+  const old = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ 生成中…'; }
+  try {
+    const resp = await fetch('/api/draft/export', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ text, fmt }),
+    });
+    if (!resp.ok) {
+      let d = resp.statusText;
+      try { const j = await resp.json(); d = j.detail || d; } catch (e) { /* ignore */ }
+      alert('导出失败：' + d);
+      return;
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const raw = (reqInput.value || '合同草案').trim().slice(0, 24).replace(/[\\/:*?"<>|\s]+/g, '_');
+    a.download = (raw || 'contract_draft') + '.' + fmt;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert('导出失败：' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = old; }
+  }
+}
+
+genBtn.addEventListener('click', () => doDraft(false));
+rewriteBtn.addEventListener('click', () => doDraft(true));
+copyBtn.addEventListener('click', copyAll);
+saveBtn.addEventListener('click', saveDraft);
+document.querySelectorAll('.export-btn').forEach(b =>
+  b.addEventListener('click', () => exportFile(b.dataset.fmt)));
+clearBtn.addEventListener('click', () => {
+  draftFull = '';
+  renderDraft();
+  reqInput.value = '';
+  copyBtn.disabled = true;
+  hideStage();
+});
+</script>
+</body>
+</html>

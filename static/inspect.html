@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>合同巡检 · Contract AI</title>
+<link rel="stylesheet" href="/static/style.css?v=5">
+</head>
+<body>
+  <header class="navbar">
+    <div class="brand"><span class="logo">⚖️</span> Contract AI</div>
+    <nav>
+      <a href="/kb" data-page="kb">📚 知识库问答</a>
+      <a href="/" data-page="chat">🤖 智能体对话</a>
+      <a href="/draft" data-page="draft">📝 AI 起草</a>
+      <a href="/review" data-page="review">📋 合同审查</a>
+      <a href="/inspect" data-page="inspect">📊 合同巡检</a>
+      <a href="/ingest" data-page="ingest">📤 合同入库</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <div class="card">
+      <div class="page-title">📊 合同巡检 · 批量要素比对</div>
+      <div class="page-sub">一键批量抽取合同库中全部合同的关键要素（类型/当事人/金额/期限/日期/争议解决等），汇成可比对的台账表——支持搜索筛选与导出 CSV。适合合同对账、巡检与合规报表。</div>
+
+      <div class="inspect-top">
+        <button class="btn btn-primary" id="runBtn">🚀 开始巡检（批量抽取全部合同）</button>
+        <span class="ctx-hint" id="fileTag"></span>
+      </div>
+
+      <div id="progPanel" class="inspect-prog hidden">
+        <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+          <span id="progText" style="font-size:13px;color:var(--muted);"></span>
+          <span id="progPct" style="font-size:13px;font-weight:700;color:var(--primary);"></span>
+        </div>
+        <div style="height:8px;border-radius:8px;background:#e2e8f0;overflow:hidden;">
+          <div id="progFill" style="height:100%;width:0%;border-radius:8px;background:linear-gradient(90deg,#8b5cf6,#a78bfa);transition:width .3s ease;"></div>
+        </div>
+      </div>
+
+      <div id="toolRow" class="inspect-tools hidden">
+        <input id="kwInput" placeholder="🔍 筛选：合同名 / 类型 / 当事人 / 金额…" />
+        <button class="btn btn-ghost" id="csvBtn">⬇️ 导出 CSV</button>
+        <span class="ctx-hint" id="rowCount"></span>
+      </div>
+
+      <div class="result-box" id="inspectBox" style="padding:0;overflow:auto;">
+        <div class="empty-tip" id="emptyTip">点击「开始巡检」，智能体会按合同逐个抽取要素并汇成比对表（约每份 10–20 秒）。</div>
+      </div>
+    </div>
+  </main>
+
+<script src="/static/main.js?v=5"></script>
+<script>
+initPage('inspect');
+
+const runBtn = document.getElementById('runBtn');
+const progPanel = document.getElementById('progPanel');
+const progText = document.getElementById('progText');
+const progPct = document.getElementById('progPct');
+const progFill = document.getElementById('progFill');
+const toolRow = document.getElementById('toolRow');
+const kwInput = document.getElementById('kwInput');
+const csvBtn = document.getElementById('csvBtn');
+const rowCount = document.getElementById('rowCount');
+const inspectBox = document.getElementById('inspectBox');
+const emptyTip = document.getElementById('emptyTip');
+const fileTag = document.getElementById('fileTag');
+const INSPECT_JOB_KEY = 'ct_inspect_job';
+const COLUMNS = ['title', 'folder', '合同类型', '甲方', '乙方', '合同金额', '履行期限', '签订日期', '生效条件', '争议解决', '通知方式', '份数与生效'];
+
+let rows = [];
+let es = null;
+let running = false;
+
+apiJSON('/api/files').then(j => {
+  const n = ((j && j.files) || []).length;
+  fileTag.textContent = n ? '当前合同库共 ' + n + ' 份合同' : '合同库为空，请先到「合同入库」导入';
+}).catch(() => {});
+
+function setProg(pct, text) {
+  progPanel.classList.remove('hidden');
+  progFill.style.width = Math.max(0, Math.min(100, pct)) + '%';
+  progPct.textContent = Math.round(pct) + '%';
+  if (text != null) progText.textContent = text;
+}
+function cleanCell(v) {
+  if (v == null) return '';
+  const s = String(v);
+  return (s === 'null' || s === 'None') ? '' : s;
+}
+function escCell(s) { return esc(cleanCell(s)); }
+
+function renderTable() {
+  inspectBox.innerHTML = '';
+  emptyTip.classList.add('hidden');
+  if (!rows.length) {
+    const d = document.createElement('div');
+    d.className = 'empty-tip';
+    d.textContent = '暂无巡检数据，请先点击「开始巡检」。';
+    inspectBox.appendChild(d);
+    return;
+  }
+  const kw = (kwInput.value || '').trim().toLowerCase();
+  const shown = kw ? rows.filter(r => COLUMNS.some(c => String(r[c] || '').toLowerCase().includes(kw))) : rows;
+  rowCount.textContent = '共 ' + shown.length + ' / ' + rows.length + ' 份合同';
+  if (!shown.length) {
+    const d = document.createElement('div');
+    d.className = 'empty-tip';
+    d.textContent = '没有匹配「' + kwInput.value + '」的合同。';
+    inspectBox.appendChild(d);
+    return;
+  }
+  const table = document.createElement('table');
+  table.className = 'inspect-table';
+  const thead = '<tr><th>#</th>' + COLUMNS.map(c => '<th>' + (c === 'title' ? '合同标题' : c === 'folder' ? '文件夹' : c) + '</th>').join('') + '</tr>';
+  const body = shown.map((r, i) => {
+    const tds = COLUMNS.map(c => {
+      if (c === 'title') return '<td class="td-title">📄 ' + escCell(r[c]) + '</td>';
+      return '<td>' + escCell(r[c]) + '</td>';
+    }).join('');
+    return '<tr><td class="td-idx">' + (i + 1) + '</td>' + tds + '</tr>';
+  }).join('');
+  table.innerHTML = thead + '<tbody>' + body + '</tbody>';
+  inspectBox.appendChild(table);
+}
+kwInput.addEventListener('input', renderTable);
+
+function downloadCSV() {
+  if (!rows.length) return;
+  const head = ['合同标题', '文件夹'].concat(COLUMNS.slice(2));
+  const lines = [head.join(',')];
+  rows.forEach(r => {
+    lines.push(COLUMNS.map(c => '"' + String(cleanCell(r[c])).replace(/"/g, '""') + '"').join(','));
+  });
+  const blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = '合同巡检台账.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(a.href);
+}
+csvBtn.addEventListener('click', downloadCSV);
+
+function closeES() { if (es) { es.close(); es = null; } }
+function connectJob(id) {
+  closeES();
+  es = new EventSource('/api/jobs/' + encodeURIComponent(id) + '/stream?token=' + encodeURIComponent(getToken()));
+  es.onmessage = e => {
+    let ev;
+    try { ev = JSON.parse(e.data); } catch (_) { return; }
+    const t = ev.type, d = ev.data || {};
+    if (t === 'stage') {
+      const m = (d.text || '').match(/\[(\d+)\/(\d+)\]/);
+      setProg(m ? (+m[1] / +m[2]) * 100 : 50, d.text || '');
+    } else if (t === 'result') {
+      if (d && Array.isArray(d.rows)) { rows = d.rows; renderTable(); }
+    } else if (t === 'done') {
+      finishRun();
+    } else if (t === 'error') {
+      setProg(100, '⚠️ 巡检失败：' + (d.message || '未知错误'));
+      finishRun();
+    }
+  };
+  es.onerror = () => { /* EventSource 自动重连 */ };
+}
+function finishRun() {
+  running = false;
+  closeES();
+  runBtn.disabled = false;
+  runBtn.textContent = '🚀 再次巡检';
+  toolRow.classList.remove('hidden');
+  setProg(100, '✅ 巡检完成：共 ' + rows.length + ' 份合同');
+  sessionStorage.removeItem(INSPECT_JOB_KEY);
+}
+
+async function startRun() {
+  if (running) return;
+  running = true;
+  runBtn.disabled = true;
+  runBtn.textContent = '⏳ 巡检进行中…';
+  rows = [];
+  toolRow.classList.add('hidden');
+  inspectBox.innerHTML = '';
+  emptyTip.classList.remove('hidden');
+  emptyTip.textContent = '巡检进行中，请稍候…';
+  setProg(0, '正在准备批量抽取…');
+  try {
+    const j = await apiJSON('/api/inspect/run', { method: 'POST' });
+    sessionStorage.setItem(INSPECT_JOB_KEY, j.job_id);
+    connectJob(j.job_id);
+  } catch (e) {
+    alert('启动失败：' + ((e && e.message) || '未知错误'));
+    running = false; runBtn.disabled = false; runBtn.textContent = '🚀 开始巡检';
+  }
+}
+runBtn.addEventListener('click', startRun);
+
+// 刷新/切页回来：恢复进行中或已完成的巡检
+function maybeRestore() {
+  const id = sessionStorage.getItem(INSPECT_JOB_KEY);
+  if (!id) return;
+  apiJSON('/api/jobs/' + encodeURIComponent(id) + '/status')
+    .then(s => {
+      if (!s || !s.exists) { sessionStorage.removeItem(INSPECT_JOB_KEY); return; }
+      if (s.status === 'running') {
+        running = true;
+        runBtn.disabled = true;
+        runBtn.textContent = '⏳ 巡检进行中…';
+        const m = (s.text || '').match(/\[(\d+)\/(\d+)\]/);
+        setProg(m ? (+m[1] / +m[2]) * 100 : 50, s.text || '正在巡检…');
+        connectJob(id);
+      } else if (s.status === 'done') {
+        if (s.payload && Array.isArray(s.payload.rows)) {
+          rows = s.payload.rows;
+          renderTable();
+          toolRow.classList.remove('hidden');
+          setProg(100, '✅ 巡检完成：共 ' + rows.length + ' 份合同');
+        }
+        sessionStorage.removeItem(INSPECT_JOB_KEY);
+      } else {
+        sessionStorage.removeItem(INSPECT_JOB_KEY);
+      }
+    }).catch(() => {});
+}
+maybeRestore();
+</script>
+</body>
+</html>

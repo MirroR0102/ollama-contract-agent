@@ -14,7 +14,7 @@ import time
 
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 
-from config import OLLAMA_HOST, LLM_MODEL_NAME, EMBED_MODEL_NAME
+from core.config import OLLAMA_HOST, LLM_MODEL_NAME, EMBED_MODEL_NAME
 
 # ---------- 重试策略 ----------
 MAX_RETRY = 2          # 连接失效后最多重建并重试 2 次（含首建共 3 次尝试）

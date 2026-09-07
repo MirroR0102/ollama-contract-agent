@@ -12,7 +12,9 @@
     <nav>
       <a href="/kb" data-page="kb">📚 知识库问答</a>
       <a href="/" data-page="chat">🤖 智能体对话</a>
+      <a href="/draft" data-page="draft">📝 AI 起草</a>
       <a href="/review" data-page="review">📋 合同审查</a>
+      <a href="/inspect" data-page="inspect">📊 合同巡检</a>
       <a href="/ingest" data-page="ingest">📤 合同入库</a>
     </nav>
   </header>
@@ -29,6 +31,18 @@
         <button class="btn btn-primary" id="reviewBtn">开始审查</button>
         <button class="btn" id="stopBtn" style="display:none;">⏹ 停止任务</button>
       </div>
+      <div class="dim-sel" id="dimSel" style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
+        <span style="font-size:12.5px;color:var(--muted);">审查维度：</span>
+        <label class="dim-chip"><input type="checkbox" value="违约金与赔偿" checked><span>违约金</span></label>
+        <label class="dim-chip"><input type="checkbox" value="付款与结算" checked><span>付款结算</span></label>
+        <label class="dim-chip"><input type="checkbox" value="保密义务" checked><span>保密</span></label>
+        <label class="dim-chip"><input type="checkbox" value="合同解除与终止" checked><span>解约终止</span></label>
+        <label class="dim-chip"><input type="checkbox" value="知识产权" checked><span>知识产权</span></label>
+        <label class="dim-chip"><input type="checkbox" value="争议解决" checked><span>争议解决</span></label>
+        <label class="dim-chip"><input type="checkbox" value="责任限制与免责" checked><span>责任限制</span></label>
+        <label class="dim-chip"><input type="checkbox" value="核心义务与违约责任" checked><span>核心义务</span></label>
+        <label class="dim-chip dim-all"><input type="checkbox" id="dimAll" checked><span>全选</span></label>
+      </div>
       <div id="modelTag" style="color:var(--muted);font-size:12px;margin-top:8px;"></div>
 
       <div id="progPanel" style="display:none;margin-top:14px;">
@@ -39,10 +53,21 @@
         <div style="height:10px;border-radius:8px;background:#e2e8f0;overflow:hidden;">
           <div id="progFill" style="height:100%;width:0%;border-radius:8px;background:linear-gradient(90deg,#3b82f6,#60a5fa);transition:width .4s ease;"></div>
         </div>
+        <div id="reviewTarget" style="margin-top:9px;font-size:13.5px;font-weight:600;color:#1e293b;"></div>
+      </div>
+
+      <div id="viewTabs" style="display:none;margin-top:18px;gap:8px;align-items:center;">
+        <button type="button" class="btn viewtab active" data-v="dims">📊 分维度明细</button>
+        <button type="button" class="btn viewtab" data-v="report">🤖 报告解读</button>
+        <span id="reportStatus" style="color:var(--muted);font-size:12px;"></span>
       </div>
 
       <div class="result-box" id="reportBox">
         <div class="empty-tip" id="emptyTip">选择一份合同后点击「开始审查」</div>
+      </div>
+
+      <div class="result-box" id="reportView" style="display:none;">
+        <div class="empty-tip">审查完成后可切换到「🤖 报告解读」查看智能体总结</div>
       </div>
     </div>
   </main>
@@ -58,6 +83,19 @@ const emptyTip = document.getElementById('emptyTip');
 const progPanel = document.getElementById('progPanel');
 const progText = document.getElementById('progText');
 const progPct = document.getElementById('progPct');
+const reviewTarget = document.getElementById('reviewTarget');
+let reviewingName = '';
+const viewTabs = document.getElementById('viewTabs');
+const reportView = document.getElementById('reportView');
+const reportStatus = document.getElementById('reportStatus');
+const SUMMARY_JOB_KEY = 'ct_report_job';   // 报告解读后台任务
+const RESULT_KEY = 'ct_review_state';       // 已完成审查结果（切页/刷新恢复用）
+const REPORT_KEY = 'ct_report_text';        // 已生成的报告解读全文（避免重复生成）
+let summaryStarted = false;   // 报告解读是否已启动
+let currentView = 'dims';     // dims / report
+let summaryJobId = '';
+let sumES = null;             // 报告解读 EventSource
+let sumBubble = null;         // 报告解读输出气泡
 const progFill = document.getElementById('progFill');
 
 const JOB_KEY = 'contract_review_job';
@@ -118,6 +156,129 @@ function resetReport() {
   pending = null;
   reportBox.innerHTML = '';
   emptyTip.classList.add('hidden');
+  resetSummaryUI();
+}
+
+/* ===== 明细 / 报告解读 双视图 ===== */
+function closeSummaryES() { if (sumES) { sumES.close(); sumES = null; } }
+function resetSummaryUI() {
+  summaryStarted = false;
+  if (summaryJobId) {
+    // 中止仍在后台运行的报告任务（重新审查时不再需要）
+    try { navigator.sendBeacon && navigator.sendBeacon('/api/jobs/' + summaryJobId + '/abort?token=' + encodeURIComponent(getToken())); } catch (_) { /* noop */ }
+  }
+  summaryJobId = '';
+  closeSummaryES();
+  sessionStorage.removeItem(SUMMARY_JOB_KEY);
+  viewTabs.style.display = 'none';
+  reportView.style.display = 'none';
+  reportView.innerHTML = '';
+  sumBubble = null;
+  currentView = 'dims';
+  reportStatus.textContent = '';
+}
+function showResultTabs(autostart) {
+  if (!results.length) return;
+  viewTabs.style.display = 'flex';
+  switchView(autostart ? 'report' : 'dims');
+}
+function switchView(v) {
+  currentView = v;
+  document.querySelectorAll('#viewTabs .viewtab').forEach(b => b.classList.toggle('active', b.dataset.v === v));
+  reportBox.style.display = (v === 'dims') ? '' : 'none';
+  reportView.style.display = (v === 'report') ? '' : 'none';
+  if (v === 'report') maybeStartSummary();
+}
+function buildSummaryBubble() {
+  reportView.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.className = 'chat';
+  wrap.innerHTML = `<div class="msg ai"><div class="avatar">🤖</div><div class="bubble"></div></div>`;
+  reportView.appendChild(wrap);
+  const b = wrap.querySelector('.bubble');
+  b.classList.add('cursor');
+  return b;
+}
+function summaryScroll() { reportView.scrollTop = reportView.scrollHeight; }
+function summaryDone(payload) {
+  closeSummaryES(); summaryJobId = ''; sessionStorage.removeItem(SUMMARY_JOB_KEY);
+  let text = (typeof payload === 'string' && payload) ? payload : '';
+  if (sumBubble) {
+    if (!text) text = sumBubble.textContent || '';
+    sumBubble.textContent = text || sumBubble.textContent;
+    sumBubble.classList.remove('cursor');
+  }
+  reportStatus.textContent = '✅ 报告解读生成完成';
+  try { if (text) sessionStorage.setItem(REPORT_KEY, JSON.stringify({ text })); } catch (_) { /* noop */ }
+}
+function summaryFail(msg, canRetry) {
+  closeSummaryES(); summaryJobId = ''; sessionStorage.removeItem(SUMMARY_JOB_KEY);
+  if (sumBubble) { sumBubble.classList.remove('cursor'); sumBubble.textContent += '\n❌ ' + (msg || '生成失败'); }
+  reportStatus.textContent = '⚠️ ' + (msg || '生成中断') + '（可切换到「报告解读」重新生成）';
+  if (canRetry) summaryStarted = false;
+}
+function onSummaryEvent(ev) {
+  const t = ev.type, d = ev.data || {};
+  if (t === 'snapshot') {
+    if (d.status === 'done') { summaryDone(d.payload || null); }
+    else if (d.status === 'error') { summaryFail(d.error || '生成失败'); }
+    else {
+      if (d.text && sumBubble && !sumBubble.textContent) sumBubble.textContent = d.text;  // 续接已有进度
+      reportStatus.textContent = '🤖 报告解读智能体生成中…';
+    }
+  } else if (t === 'token') {
+    if (sumBubble) { sumBubble.textContent += (d.text || ''); summaryScroll(); }
+  } else if (t === 'result') { summaryDone(d); }
+  else if (t === 'done') { summaryDone(null); }
+  else if (t === 'error') { summaryFail((d.message || d.text || '生成失败')); }
+}
+function connectSummaryJob(id) {
+  closeSummaryES();
+  sumES = new EventSource('/api/jobs/' + encodeURIComponent(id) + '/stream?token=' + encodeURIComponent(getToken()));
+  sumES.onmessage = (e) => { try { onSummaryEvent(JSON.parse(e.data)); } catch (_) { /* noop */ } };
+  sumES.onerror = () => {
+    // 任务可能已失效（如服务重启）→ 断开并允许重新生成
+    summaryFail('报告任务已失效（服务可能重启）', true);
+  };
+}
+async function maybeStartSummary() {
+  if (summaryStarted || !results.length || running) return;
+  summaryStarted = true;
+  // 报告已生成过并持久化 → 直接展示，不重复调用模型
+  try {
+    const rr = sessionStorage.getItem(REPORT_KEY);
+    if (rr) {
+      const rp = JSON.parse(rr);
+      if (rp && rp.text) {
+        sumBubble = buildSummaryBubble();
+        sumBubble.textContent = rp.text;
+        sumBubble.classList.remove('cursor');
+        reportStatus.textContent = '✅ 报告解读生成完成';
+        return;
+      }
+    }
+  } catch (_) { /* ignore */ }
+  sumBubble = buildSummaryBubble();
+  reportStatus.textContent = '提交报告解读任务…';
+  // 若切页前已有进行中的报告任务 → 直接续接，不重复创建
+  try {
+    const raw = sessionStorage.getItem(SUMMARY_JOB_KEY);
+    if (raw) {
+      const st = JSON.parse(raw);
+      if (st && st.job) { summaryJobId = st.job; reportStatus.textContent = '正在续接报告解读生成…'; connectSummaryJob(st.job); return; }
+    }
+  } catch (_) { /* ignore */ }
+  try {
+    const j = await apiJSON('/api/review/summary', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: reviewingName, results }),
+    });
+    summaryJobId = j.job_id;
+    sessionStorage.setItem(SUMMARY_JOB_KEY, JSON.stringify({ job: j.job_id }));
+    connectSummaryJob(j.job_id);
+  } catch (e) {
+    summaryFail((e && e.message) || '提交失败', true);
+  }
 }
 function cardEl() {
   const el = document.createElement('div');
@@ -145,7 +306,7 @@ function renderAll() {
         <div class="lbl">📌 依据原文</div>
         <div class="evidence-text ev-slot" style="color:var(--muted);">分析中…</div>
         <div class="lbl">💡 审查意见</div>
-        <div class="op-slot" style="color:var(--muted);">分析中…</div>
+        <div class="op op-slot" style="color:var(--muted);">分析中…</div>
       </div>`;
     curCardEl = card;
   }
@@ -160,7 +321,7 @@ function fillResultCard(card, d) {
       <div class="lbl">📌 依据原文</div>
       <div class="evidence-text">${esc(d.evidence || '未找到相关条款')}</div>
       <div class="lbl">💡 审查意见</div>
-      <div>${esc(d.opinion || '')}</div>
+      <div class="op">${esc(d.opinion || '')}</div>
     </div>`;
 }
 /* ---------- 结构化流式输出 ---------- */
@@ -250,10 +411,14 @@ function onDimDone(d) {
 function onDone() {
   stopTimer();
   if (results.length > 0) showSummary();
+  if (reviewingName) reviewTarget.innerHTML = `✅ 已完成《${esc(reviewingName)}》审查`;
   setProg(100, '✅ 审查完成，共 ' + results.length + ' 个维度');
   setIdle();
+  // 持久化完成态：切页/刷新后仍可恢复明细，并让报告解读能续接/复用
+  try { if (results.length) sessionStorage.setItem(RESULT_KEY, JSON.stringify({ filename: reviewingName, results })); } catch (_) { /* noop */ }
   clearJobStorage();
   closeES();
+  if (results.length) showResultTabs(true);   // 审查结束 → 收起明细、切到报告解读
 }
 function onError(msg) {
   stopTimer();
@@ -292,6 +457,7 @@ function handleSnapshot(s) {
     renderAll();
     if (results.length) { showSummary(); setProg(100, '✅ 审查完成（历史任务）'); }
     setIdle(); clearJobStorage(); closeES();
+    showResultTabs(false);   // 历史任务：显示双视图，用户可切到报告解读手动生成
   } else if (s.status === 'paused') {
     renderAll();
     onPaused();
@@ -314,9 +480,36 @@ function handle(ev) {
 }
 
 /* ---------- 提交 / 订阅 ---------- */
+function selectedDims() {
+  return [...document.querySelectorAll('#dimSel input[type=checkbox]:checked:not(#dimAll)')]
+    .map(i => i.value);
+}
+function syncDimAll() {
+  const boxes = [...document.querySelectorAll('#dimSel input[type=checkbox]:not(#dimAll)')];
+  const all = document.getElementById('dimAll');
+  if (all) all.checked = boxes.every(b => b.checked);
+}
+function bindDimSel() {
+  const all = document.getElementById('dimAll');
+  if (all) {
+    all.addEventListener('change', () => {
+      const on = all.checked;
+      document.querySelectorAll('#dimSel input[type=checkbox]:not(#dimAll)')
+        .forEach(b => { b.checked = on; });
+    });
+  }
+  document.querySelectorAll('#dimSel input[type=checkbox]:not(#dimAll)').forEach(b =>
+    b.addEventListener('change', syncDimAll));
+}
 async function submitReview() {
   const filename = fileSelect.value;
   if (!filename || running || paused) return;
+  const dims = selectedDims();
+  if (!dims.length) { alert('请至少勾选一个审查维度'); return; }
+  reviewingName = filename;
+  // 新审查开始 → 清除上一份合同持久化的完成态
+  try { sessionStorage.removeItem(RESULT_KEY); sessionStorage.removeItem(REPORT_KEY); } catch (_) { /* noop */ }
+  reviewTarget.innerHTML = `📄 正在审查：《${esc(filename)}》`;
   setActive();
   resetReport();
   progPanel.style.display = 'block';
@@ -325,9 +518,9 @@ async function submitReview() {
     const j = await apiJSON('/api/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filename }),
+      body: JSON.stringify({ filename, dims }),
     });
-    totalDims = j.total_dims || 8;
+    totalDims = j.total_dims || dims.length;
     jobId = j.job_id;
     sessionStorage.setItem(JOB_KEY, jobId);
     setProg(0, '任务已提交，正在加载合同知识库…');
@@ -377,16 +570,46 @@ function maybeRestore() {
     .catch(() => { /* 服务暂不可用，忽略 */ });
 }
 
+/* ---------- 页面恢复：已完成态（审查结果 + 报告解读） ---------- */
+function maybeRestoreFinished() {
+  let raw = null;
+  try { raw = sessionStorage.getItem(RESULT_KEY); } catch (_) { return; }
+  if (!raw) return;
+  let st = null;
+  try { st = JSON.parse(raw); } catch (_) { return; }
+  if (!st || !Array.isArray(st.results) || !st.results.length) { sessionStorage.removeItem(RESULT_KEY); return; }
+  reviewingName = st.filename || '';
+  results = st.results.slice();
+  renderAll();
+  if (results.length) showSummary();
+  progPanel.style.display = 'block';
+  setProg(100, '✅ 审查完成，共 ' + results.length + ' 个维度');
+  if (reviewingName) reviewTarget.innerHTML = `✅ 已完成《${esc(reviewingName)}》审查`;
+  setIdle();
+  showResultTabs(false);
+  // 报告解读仍在后台生成 → 自动续接；报告已生成 → 直接展示
+  let resume = false;
+  try { resume = !!sessionStorage.getItem(SUMMARY_JOB_KEY); } catch (_) { /* noop */ }
+  let hasReport = false;
+  try { hasReport = !!sessionStorage.getItem(REPORT_KEY); } catch (_) { /* noop */ }
+  if (resume || hasReport) switchView('report');
+}
+
 /* ---------- 离开页面：通知后端（浏览器关闭 / 切页） ---------- */
 window.addEventListener('pagehide', () => {
   if (es) { es.close(); es = null; }
+  closeSummaryES();   // 关闭订阅但不中止后台报告任务（切页不打断，回来自动续接）
   if (jobId) {
     try { navigator.sendBeacon && navigator.sendBeacon('/api/jobs/' + jobId + '/leave?token=' + encodeURIComponent(getToken())); } catch (_) { /* noop */ }
   }
 });
 
 /* ---------- 事件绑定 ---------- */
+document.querySelectorAll('#viewTabs .viewtab').forEach(b => {
+  b.addEventListener('click', () => switchView(b.dataset.v));
+});
 reviewBtn.addEventListener('click', submitReview);
+bindDimSel();
 stopBtn.addEventListener('click', async () => {
   if (!jobId) return;
   const action = running ? 'pause' : 'resume';
@@ -404,6 +627,7 @@ stopBtn.addEventListener('click', async () => {
 });
 loadFiles();
 maybeRestore();
+maybeRestoreFinished();   // 已完成审查结果 + 报告解读恢复
 </script>
 </body>
 </html>

@@ -16,9 +16,9 @@ from langchain_core.messages import (
 )
 from langgraph.checkpoint.memory import MemorySaver
 
-from config import LLM_MODEL_NAME
-from ollama_conn import get_llm
-from tools import ALL_TOOLS
+from agent.tools import ALL_TOOLS
+from core.config import LLM_MODEL_NAME
+from core.ollama_conn import get_llm
 
 # 初始化会话记忆检查点（短期上下文记忆：同一 thread 记住多轮对话）
 memory = MemorySaver()
@@ -31,18 +31,29 @@ _SYSTEM_PROMPT = (
     "2. 用户要求审查/分析合同风险时，调用 analyze_contract_tool；\n"
     "3. 用户要求提取合同关键信息时，调用 extract_contract_elements_tool；\n"
     "4. 用户询问有哪些合同时，调用 list_contract_files_tool；\n"
-    "5. 回答尽量给出依据（来源文件/原文片段），语言简洁专业。"
+    "5. 回答尽量给出依据（来源文件/原文片段），语言简洁专业；\n"
+    "6. 禁止输出“我将调用…”“请稍候”“让我查找…”等过渡语：需要检索或工具时直接发起工具调用，"
+    "取得工具结果后再给出完整回答；确无工具可解时如实说明；\n"
+    "7. 最终回答要精炼：概述要点并引用条款编号/关键句即可，不要整段复述工具返回的原文，避免重复；\n"
+    "8. 工具选用规则：问“有多少合同/切片/知识库规模”用 get_kb_stats_tool；问某合同详情/备注/大小"
+    "用 get_contract_info_tool；按文件夹查看合同库用 list_folders_tool；要“精确查看某关键词在原文"
+    "出现的位置/原文段落”用 locate_clause_tool；要求总结/概括某份合同整体内容时必须调用 "
+    "summarize_contract_tool 通读全文后再总结（禁止只凭对话记忆或模板总结）；要求对比/比较两份合同"
+    "时必须调用 compare_contracts_tool。\n"
 )
 
 _agent = None
 
 
-def _build_agent():
-    """创建标准 LangChain Agent（每次重建都会绑定最新的 LLM 连接实例）。"""
+def build_agent(system_prompt: str | None = None):
+    """创建标准 LangChain Agent（绑定最新 LLM 连接 + 全局多轮记忆）。
+    可传入动态 system_prompt（如按会话注入“当前处理对象”范围）。
+    """
     return create_agent(
         model=get_llm(),
         tools=ALL_TOOLS,
-        system_prompt=_SYSTEM_PROMPT,
+        system_prompt=system_prompt or _SYSTEM_PROMPT,
+        checkpointer=memory,   # 真正的多轮记忆：thread_id 隔离各会话
     )
 
 
@@ -50,14 +61,14 @@ def get_agent():
     """返回当前 Agent 实例（惰性创建；连接失效时由 reset_agent 重建）。"""
     global _agent
     if _agent is None:
-        _agent = _build_agent()
+        _agent = build_agent()
     return _agent
 
 
 def reset_agent():
-    """重建 Agent（LLM 连接失效时调用，绑定全新连接后可无损重试整轮）。"""
+    """重建默认 Agent（LLM 连接失效时调用，绑定全新连接后可无损重试整轮）。"""
     global _agent
-    _agent = _build_agent()
+    _agent = build_agent()
     print("  [重连] 已重建 LangGraph Agent（绑定新 LLM 连接）", flush=True)
     return _agent
 

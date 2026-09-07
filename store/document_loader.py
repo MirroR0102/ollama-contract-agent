@@ -9,7 +9,7 @@ import os
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from config import CHUNK_SIZE, CHUNK_OVERLAP
+from core.config import CHUNK_SIZE, CHUNK_OVERLAP
 
 # 合同专用分块器：先按段落、再按中文句读切分，尽量保住条款完整性
 text_splitter = RecursiveCharacterTextSplitter(

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>合同入库 · Contract AI</title>
-<link rel="stylesheet" href="/static/style.css?v=3">
+<link rel="stylesheet" href="/static/style.css?v=4">
 </head>
 <body>
   <header class="navbar">
@@ -12,110 +12,615 @@
     <nav>
       <a href="/kb" data-page="kb">📚 知识库问答</a>
       <a href="/" data-page="chat">🤖 智能体对话</a>
+      <a href="/draft" data-page="draft">📝 AI 起草</a>
       <a href="/review" data-page="review">📋 合同审查</a>
+      <a href="/inspect" data-page="inspect">📊 合同巡检</a>
       <a href="/ingest" data-page="ingest">📤 合同入库</a>
     </nav>
   </header>
 
   <main class="container">
+    <!-- ============ 第一卡：导入 ============ -->
     <div class="card">
       <div class="page-title">📤 合同入库</div>
-      <div class="page-sub">上传 txt / pdf 合同 → 智能分块 → 向量化存入本地 Chroma，供知识库问答与合同审查使用。</div>
+      <div class="page-sub">支持 txt / pdf / docx / 图片(jpg,jpeg,png) / zip 压缩包。先上传暂存 →「文档接入智能体」识别类型并解析（图片走 OCR、压缩包自动切分）→ 你确认名称/备注后入库，全程实时进度。</div>
 
-      <div style="border:2px dashed var(--border);border-radius:14px;padding:28px;text-align:center;background:#f8fafc;" id="dropZone">
-        <div style="font-size:40px;">📄</div>
-        <div style="margin:10px 0 14px;color:var(--muted);">拖拽合同文件到此处，或点击选择（支持 .txt / .pdf）</div>
-        <input type="file" id="fileInput" accept=".txt,.pdf" style="display:none;">
+      <div class="step-note" id="typeTip">💡 图片多为扫描件/拍照件，OCR 可能存在识别错误；建议入库后用「智能体对话」让助手通读核对。压缩包会解压后由智能体自动切分为若干「合同候选」，可勾选导入。</div>
+
+      <!-- 选择文件 -->
+      <div style="border:2px dashed var(--border);border-radius:14px;padding:26px;text-align:center;background:#f8fafc;" id="dropZone">
+        <div style="font-size:38px;">📄</div>
+        <div style="margin:8px 0 12px;color:var(--muted);">拖拽文件到此处，或点击选择<br><span style="font-size:12px;">支持 .txt .pdf .docx .jpg .jpeg .png .zip（单个 ≤ 80MB）</span></div>
+        <input type="file" id="fileInput" accept=".txt,.pdf,.docx,.jpg,.jpeg,.png,.zip" style="display:none;">
         <button class="btn btn-primary" id="pickBtn">选择文件</button>
-        <button class="btn btn-primary hidden" id="uploadBtn" style="margin-left:8px;">上传入库</button>
-        <div id="fileName" style="margin-top:10px;font-weight:600;" class="hidden"></div>
+        <div id="pickName" class="hidden" style="margin-top:10px;font-weight:600;"></div>
       </div>
 
-      <div id="uploadResult" class="hidden" style="margin-top:14px;padding:12px 16px;border-radius:10px;font-size:14px;"></div>
+      <!-- 分析 / 入库进度 -->
+      <div class="stage-box hidden" id="jobBox">
+        <div class="progress-line">
+          <span class="spinner"></span>
+          <span id="jobStage" style="font-size:14px;"></span>
+        </div>
+        <div style="height:8px;border-radius:8px;background:#e2e8f0;overflow:hidden;margin-top:10px;">
+          <div id="jobFill" style="height:100%;width:8%;background:linear-gradient(90deg,#3b82f6,#60a5fa);transition:width .5s;"></div>
+        </div>
+      </div>
+
+      <!-- 单文件确认表单（分析完成后显示） -->
+      <div class="ingest-card hidden" id="formSingle">
+        <div class="card-title">📋 确认信息后入库</div>
+        <div class="field">
+          <label>合同名称（自动填入原文件名，可修改）</label>
+          <input type="text" id="sTitle" placeholder="合同名称">
+          <div class="hint" id="sOrigName"></div>
+        </div>
+        <div class="field">
+          <label>备注（可选，用于区分同名合同）</label>
+          <textarea id="sNote" rows="2" placeholder="例如：2026 年与 XX 公司签订的版本一" style="resize:vertical;"></textarea>
+        </div>
+        <div class="field">
+          <label>放入文件夹（合同库）</label>
+          <select id="sFolder"></select>
+        </div>
+        <div id="sWarns"></div>
+        <div style="display:flex;gap:10px;margin-top:6px;">
+          <button class="btn btn-primary" id="sCommitBtn">开始入库</button>
+          <button class="btn btn-ghost" id="sCancelBtn">重新选择</button>
+        </div>
+      </div>
+
+      <!-- 压缩包候选（多份合同） -->
+      <div class="ingest-card hidden" id="formZip">
+        <div class="card-title">📦 压缩包识别结果（智能体切分）</div>
+        <div class="step-note" id="zipSummary"></div>
+        <div style="margin:8px 0;">
+          <label style="font-size:13px;display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;">
+            <input type="checkbox" id="zipAll" checked> 全选所有候选
+          </label>
+        </div>
+        <div id="candList"></div>
+        <div class="field" style="margin-top:8px;">
+          <label>统一放入文件夹（可单独修改每份的标题/备注）</label>
+          <select id="zFolder"></select>
+        </div>
+        <div id="zWarns"></div>
+        <div style="display:flex;gap:10px;margin-top:6px;">
+          <button class="btn btn-primary" id="zCommitBtn">导入所选</button>
+          <button class="btn btn-ghost" id="zCancelBtn">重新选择</button>
+        </div>
+      </div>
     </div>
 
+    <!-- ============ 第二卡：合同库管理 ============ -->
     <div class="card" style="margin-top:16px;">
-      <div class="page-title" style="font-size:17px;">🗂️ 当前合同库</div>
-      <div id="statsTag" style="color:var(--muted);font-size:13px;margin-bottom:12px;"></div>
-      <div id="fileList"></div>
-      <div class="empty-tip hidden" id="emptyFiles">库中暂无合同，请上传。</div>
+      <div class="library-head">
+        <div class="page-title" style="font-size:17px;">🗂️ 我的合同库</div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <input type="text" id="newFolderName" placeholder="新文件夹名称" style="width:200px;padding:7px 10px;font-size:13px;">
+          <button class="btn" id="newFolderBtn" style="padding:7px 14px;font-size:13px;">＋ 新建文件夹</button>
+        </div>
+      </div>
+      <div id="statsTag" style="color:var(--muted);font-size:12.5px;margin:8px 0 14px;"></div>
+      <div id="libBox"><div class="empty-tip">加载中…</div></div>
     </div>
   </main>
 
-<script src="/static/main.js?v=3"></script>
+<script src="/static/main.js?v=4"></script>
 <script>
 initPage('ingest');
 
-const dropZone = document.getElementById('dropZone');
-const fileInput = document.getElementById('fileInput');
-const pickBtn = document.getElementById('pickBtn');
-const uploadBtn = document.getElementById('uploadBtn');
-const fileNameBox = document.getElementById('fileName');
-const uploadResult = document.getElementById('uploadResult');
-const fileList = document.getElementById('fileList');
-const statsTag = document.getElementById('statsTag');
-const emptyFiles = document.getElementById('emptyFiles');
+const $ = id => document.getElementById(id);
+const dropZone = $('dropZone'), fileInput = $('fileInput'), pickBtn = $('pickBtn');
+const pickName = $('pickName');
+const jobBox = $('jobBox'), jobStage = $('jobStage'), jobFill = $('jobFill');
+const formSingle = $('formSingle'), formZip = $('formZip');
+const candList = $('candList');
 
-let pickedFile = null;
+let folders = [];          // 文件夹列表
+let stageName = '';        // 暂存文件名
+let stageSize = 0;
+let kindHint = '';         // single / zip
+let candidates = [];       // analyze 结果
+let warnings = [];
+let analyzeJobId = '';
+let es = null;
+let jobMode = 'analyze';   // analyze / commit
+let busy = false;          // 是否有进行中的任务（分析/入库）
+const JOB_KEY = 'ct_ingest_job';
 
-// 拖拽 / 点击选择
+/* ---------------- 通用 ---------------- */
+function setProg(text, pct) {
+  jobBox.classList.remove('hidden');
+  jobStage.textContent = text || '';
+  if (pct != null) jobFill.style.width = Math.min(100, Math.max(2, pct)) + '%';
+}
+function hideJob() { jobBox.classList.add('hidden'); }
+
+function closeES() { if (es) { es.close(); es = null; } }
+
+function modal(html) {
+  const m = document.createElement('div');
+  m.className = 'modal-mask';
+  m.innerHTML = `<div class="modal">${html}</div>`;
+  document.body.appendChild(m);
+  return m;
+}
+function closeModal(m) { if (m) m.remove(); }
+
+/* 两次确认删除 */
+function confirm2(title, msg1, msg2, okText, onOk) {
+  const m = modal(`
+    <h3>⚠️ ${esc(title)}</h3>
+    <p>${esc(msg1)}</p>
+    <div class="btn-row">
+      <button class="btn btn-ghost" data-act="no">取消</button>
+      <button class="btn btn-danger-soft" data-act="yes1">继续</button>
+    </div>`);
+  m.querySelector('[data-act=no]').onclick = () => closeModal(m);
+  m.querySelector('[data-act=yes1]').onclick = () => {
+    closeModal(m);
+    const m2 = modal(`
+      <h3>⚠️ ${esc(title)}（最后确认）</h3>
+      <p>${esc(msg2)}</p>
+      <div class="btn-row">
+        <button class="btn btn-ghost" data-act="no">取消</button>
+        <button class="btn btn-danger-soft" data-act="yes2">确认${esc(okText || '删除')}</button>
+      </div>`);
+    m2.querySelector('[data-act=no]').onclick = () => closeModal(m2);
+    m2.querySelector('[data-act=yes2]').onclick = async () => { closeModal(m2); await onOk(); };
+  };
+}
+
+function fmtBytes(n) {
+  if (n == null) return '';
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1048576).toFixed(1) + ' MB';
+}
+
+/* ---------------- 文件选择 / 上传暂存 ---------------- */
 pickBtn.addEventListener('click', () => fileInput.click());
 dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.style.borderColor = 'var(--primary)'; });
 dropZone.addEventListener('dragleave', () => dropZone.style.borderColor = 'var(--border)');
 dropZone.addEventListener('drop', e => { e.preventDefault(); dropZone.style.borderColor = 'var(--border)'; if (e.dataTransfer.files.length) pick(e.dataTransfer.files[0]); });
 fileInput.addEventListener('change', () => { if (fileInput.files.length) pick(fileInput.files[0]); });
 
-function pick(f) {
-  const ext = f.name.split('.').pop().toLowerCase();
-  if (!['txt', 'pdf'].includes(ext)) { alert('仅支持 txt / pdf 文件'); return; }
-  pickedFile = f;
-  fileNameBox.textContent = '已选择：' + f.name + '（' + (f.size / 1024).toFixed(1) + ' KB）';
-  fileNameBox.classList.remove('hidden');
-  uploadBtn.classList.remove('hidden');
+async function pick(f) {
+  const ext = (f.name.split('.').pop() || '').toLowerCase();
+  if (!['txt', 'pdf', 'docx', 'jpg', 'jpeg', 'png', 'zip'].includes(ext)) {
+    alert('仅支持：txt / pdf / docx / jpg / jpeg / png / zip');
+    return;
+  }
+  // 丢弃旧暂存、关闭旧任务
+  if (stageName) { try { await apiFetch('/api/ingest/discard', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stage_name: stageName }) }); } catch (e) {} }
+  closeES(); resetFlow();
+  pickName.textContent = '已选择：' + f.name + '（' + fmtBytes(f.size) + '），正在上传暂存…';
+  pickName.classList.remove('hidden');
+  const fd = new FormData();
+  fd.append('file', f);
+  try {
+    const j = await apiJSON('/api/ingest/stage', { method: 'POST', body: fd });
+    stageName = j.stage_name;
+    stageSize = j.size;
+    pickName.textContent = '✔ 已暂存：' + f.name + '（' + fmtBytes(j.size) + '）';
+    await startAnalyze();
+  } catch (e) {
+    pickName.textContent = '❌ 上传失败：' + e.message;
+  }
 }
 
-uploadBtn.addEventListener('click', async () => {
-  if (!pickedFile || uploadBtn.disabled) return;
-  uploadBtn.disabled = true;
-  uploadBtn.textContent = '入库中…';
-  const fd = new FormData();
-  fd.append('file', pickedFile);
-  try {
-    const j = await apiJSON('/api/ingest', { method: 'POST', body: fd });
-    uploadResult.classList.remove('hidden');
-    uploadResult.style.background = '#ecfdf5';
-    uploadResult.style.color = '#065f46';
-    uploadResult.innerHTML = `✅ 入库成功：<b>${esc(j.saved)}</b> ｜ 新增切片 <b>${j.added_chunks}</b> 条`;
-    loadFiles();
-  } catch (e) {
-    uploadResult.classList.remove('hidden');
-    uploadResult.style.background = '#fef2f2';
-    uploadResult.style.color = '#991b1b';
-    uploadResult.textContent = '❌ ' + e.message;
-  } finally {
-    uploadBtn.disabled = false;
-    uploadBtn.textContent = '上传入库';
-  }
-});
+function resetFlow() {
+  stageName = ''; analyzeJobId = ''; candidates = []; warnings = []; kindHint = '';
+  formSingle.classList.add('hidden');
+  formZip.classList.add('hidden');
+  jobBox.classList.add('hidden');
+  sessionStorage.removeItem(JOB_KEY);
+}
 
-async function loadFiles() {
+/* ---------------- 智能体分析（SSE） ---------------- */
+async function startAnalyze() {
+  busy = true;
+  pickName.classList.add('hidden');
+  setProg('正在提交分析任务…', 5);
+  try {
+    const j = await apiJSON('/api/ingest/analyze', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stage_name: stageName }),
+    });
+    analyzeJobId = j.job_id;
+    sessionStorage.setItem(JOB_KEY, JSON.stringify({ stage: stageName, job: j.job_id }));
+    connectJob(j.job_id, 'analyze');
+  } catch (e) {
+    setProg('❌ 提交失败：' + e.message, 100);
+    busy = false;
+  }
+}
+
+function connectJob(id, mode) {
+  jobMode = mode || 'analyze';
+  closeES();
+  es = new EventSource('/api/jobs/' + encodeURIComponent(id) + '/stream?token=' + encodeURIComponent(getToken()));
+  es.onmessage = (e) => {
+    let ev; try { ev = JSON.parse(e.data); } catch (err) { return; }
+    handleJobEvent(ev);
+  };
+}
+
+let jobResult = null;
+function handleJobEvent(ev) {
+  const t = ev.type, d = ev.data || {};
+  if (t === 'snapshot') {
+    if (d.status === 'running') { setProg(d.text || '任务进行中…', 8); }
+    else if (d.status === 'done') { setProg('已完成', 100); jobResult = d.payload || null; finishJob(); }
+    else if (d.status === 'error') { onJobError(d.error); }
+  } else if (t === 'stage') {
+    setProg(d.text || '', 20);
+  } else if (t === 'result') {
+    jobResult = d;
+    setProg('任务完成', 100);
+  } else if (t === 'done') {
+    finishJob();
+  } else if (t === 'error') {
+    onJobError((d.message || d.text || '任务出错'));
+  }
+}
+
+function onJobError(msg) {
+  busy = false; closeES(); setProg('❌ ' + (msg || '任务出错'), 100);
+}
+
+function finishJob() {
+  closeES();
+  sessionStorage.removeItem(JOB_KEY);
+  if (jobMode === 'commit') { finishCommit(); return; }
+  // 分析任务完成：渲染确认表单/候选
+  if (jobResult) { renderAnalyzeResult(jobResult); return; }
+  apiJSON('/api/jobs/' + analyzeJobId + '/status').then(s => {
+    if (s.exists && s.payload) renderAnalyzeResult(s.payload);
+    else onJobError(s.error || '分析结果为空');
+  }).catch(() => onJobError('获取分析结果失败'));
+}
+
+function finishCommit() {
+  busy = false;
+  hideJob();
+  resetFlow();
+  pickName.classList.remove('hidden');
+  pickName.textContent = '✅ 入库完成！可继续导入其它文件。';
+  loadLibrary();
+}
+
+/* 分析完成后渲染确认界面 */
+function renderAnalyzeResult(res) {
+  jobResult = null;
+  jobMode = 'analyze';
+  candidates = (res && res.candidates) || [];
+  warnings = res.warnings || [];
+  kindHint = (res.kind === 'zip') ? 'zip' : 'single';
+  hideJob();
+  if (!candidates.length) { onJobError('未识别出可入库的合同内容'); return; }
+
+  if (kindHint === 'single') {
+    const c = candidates[0];
+    $('sTitle').value = stripExt(stageName);
+    $('sOrigName').textContent = '原文件：' + stageName + '（' + fmtBytes(stageSize) + '）';
+    $('sNote').value = '';
+    renderWarns($('sWarns'), (c.warnings || []).concat(warnings));
+    renderFolderSelect('sFolder');
+    formZip.classList.add('hidden');
+    formSingle.classList.remove('hidden');
+  } else {
+    renderZipCands();
+  }
+  busy = false;
+}
+
+function stripExt(name) {
+  const i = name.lastIndexOf('.');
+  return i > 0 ? name.slice(0, i) : name;
+}
+
+function renderWarns(el, warns) {
+  el.innerHTML = '';
+  (warns || []).forEach(w => {
+    const d = document.createElement('div');
+    d.className = 'warn-tip'; d.textContent = '⚠️ ' + w;
+    el.appendChild(d);
+  });
+}
+
+function renderFolderSelect(id) {
+  const sel = $(id);
+  sel.innerHTML = folders.map(f =>
+    `<option value="${f.id}">📁 ${esc(f.name)}（${f.cnt}）</option>`).join('');
+  if (!sel.value && folders.length) sel.value = folders[0].id;
+}
+
+/* 压缩包候选渲染 */
+function renderZipCands() {
+  formSingle.classList.add('hidden');
+  $('zipSummary').textContent =
+    `共识别出 ${candidates.length} 份合同候选（每行一份，可编辑标题/备注，取消勾选即不导入）`;
+  candList.innerHTML = '';
+  candidates.forEach((c, i) => {
+    const item = document.createElement('div');
+    item.className = 'cand-item checked';
+    item.dataset.i = i;
+    const chars = (c.text || '').length;
+    const warns = (c.warnings || []).map(w => `<div class="cand-warn">⚠️ ${esc(w)}</div>`).join('');
+    item.innerHTML = `
+      <div class="cand-head">
+        <input type="checkbox" class="cand-check" checked>
+        <span class="cand-no">#${i + 1}</span>
+        <input type="text" class="cand-title" value="${esc(c.title || '')}" style="flex:1;padding:7px 10px;font-size:13.5px;">
+        <span class="cand-meta">${chars.toLocaleString()} 字</span>
+      </div>
+      ${warns}
+      <div class="field" style="margin:6px 0 0;">
+        <textarea class="cand-note" rows="1" placeholder="备注（可选，用于区分同名合同）" style="font-size:12.5px;"></textarea>
+      </div>`;
+    const check = item.querySelector('.cand-check');
+    const title = item.querySelector('.cand-title');
+    check.addEventListener('change', () => {
+      item.classList.toggle('checked', check.checked);
+      refreshZipAll();
+    });
+    title.addEventListener('input', () => item.classList.add('checked') || (check.checked = true));
+    candList.appendChild(item);
+  });
+  renderFolderSelect('zFolder');
+  renderWarns($('zWarns'), warnings);
+  formZip.classList.remove('hidden');
+  const all = $('zipAll');
+  all.checked = true;
+  all.onchange = () => {
+    document.querySelectorAll('#candList .cand-check').forEach(cb => { cb.checked = all.checked; });
+    document.querySelectorAll('#candList .cand-item').forEach(it => it.classList.toggle('checked', all.checked));
+  };
+}
+function refreshZipAll() {
+  const boxes = [...document.querySelectorAll('#candList .cand-check')];
+  const all = $('zipAll');
+  all.checked = boxes.length > 0 && boxes.every(b => b.checked);
+  all.indeterminate = boxes.some(b => b.checked) && !all.checked;
+}
+
+/* ---------------- 提交入库 ---------------- */
+$('sCancelBtn').onclick = () => { pickName.classList.remove('hidden'); pickName.textContent = '已取消，可重新选择文件。'; formSingle.classList.add('hidden'); stageName = ''; };
+$('zCancelBtn').onclick = () => { pickName.classList.remove('hidden'); pickName.textContent = '已取消，可重新选择文件。'; formZip.classList.add('hidden'); stageName = ''; };
+$('sCommitBtn').onclick = () => commitSingle();
+$('zCommitBtn').onclick = () => commitZip();
+
+function buildSingleItem() {
+  const title = $('sTitle').value.trim();
+  if (!title) { alert('请填写合同名称'); return null; }
+  return {
+    index: 0,
+    title,
+    note: $('sNote').value.trim(),
+    folder_id: Number($('sFolder').value || 0) || null,
+  };
+}
+
+function buildZipItems() {
+  const items = [];
+  document.querySelectorAll('#candList .cand-item').forEach((it, k) => {
+    const check = it.querySelector('.cand-check');
+    if (!check.checked) return;
+    const i = Number(it.dataset.i);
+    const title = it.querySelector('.cand-title').value.trim() || (candidates[i] && candidates[i].title) || ('合同' + (i + 1));
+    items.push({ index: i, title, note: it.querySelector('.cand-note').value.trim(), folder_id: Number($('zFolder').value || 0) || null });
+  });
+  return items;
+}
+
+async function doCommit(items, appendCopy) {
+  busy = true;
+  setProg('正在提交入库任务…', 5);
+  try {
+    const j = await apiJSON('/api/ingest/commit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        analyze_job_id: analyzeJobId,
+        stage_name: stageName,
+        items: items.map(it => ({ ...it, append_copy: appendCopy ? true : false })),
+      }),
+    });
+    sessionStorage.setItem(JOB_KEY, JSON.stringify({ stage: stageName, job: j.job_id, commit: true }));
+    hideJob(); formSingle.classList.add('hidden'); formZip.classList.add('hidden');
+    setProg('入库任务已启动…', 5);
+    jobResult = null;
+    connectJob(j.job_id, 'commit');
+  } catch (e) {
+    busy = false;
+    if (e.status === 409 && e.detail && e.detail.conflicts) { askConflict(items, e.detail.conflicts); return; }
+    setProg('❌ 提交失败：' + (e.message || ''), 100);
+  }
+}
+
+async function commitSingle() {
+  const it = buildSingleItem();
+  if (!it || busy) return;
+  await doCommit([it], false);
+}
+async function commitZip() {
+  const items = buildZipItems();
+  if (!items.length) { alert('请至少勾选一份合同'); return; }
+  if (busy) return;
+  await doCommit(items, false);
+}
+
+/* 冲突确认：同名+同备注 → 加（副本） */
+function askConflict(items, conflicts) {
+  const list = conflicts.map(c => `《${esc(c.title)}》（备注：${esc(c.note || '（空）')}）`).join('<br>');
+  const m = modal(`
+    <h3>⚠️ 存在同名合同</h3>
+    <p>以下 ${conflicts.length} 项与您合同库中已有合同「同名且备注完全相同」：</p>
+    <div class="conflict-list">${list}</div>
+    <p>若继续导入，将自动在其备注末尾追加<b>（副本）</b>以示区分（超长会先截断，保证“（副本）”完整显示）。</p>
+    <div class="btn-row">
+      <button class="btn btn-ghost" data-a="no">取消（返回修改）</button>
+      <button class="btn btn-primary" data-a="ok">确认，继续导入（加副本）</button>
+    </div>`);
+  m.querySelector('[data-a=no]').onclick = () => { closeModal(m); setProg('已取消：请修改名称或备注后再导入。', 100); };
+  m.querySelector('[data-a=ok]').onclick = async () => {
+    closeModal(m);
+    await doCommit(items, true);
+  };
+}
+
+/* ---------------- 库管理 ---------------- */
+const openFolders = new Set();   // 用户手动展开的文件夹（默认全部收起）
+async function loadLibrary() {
   try {
     const j = await apiJSON('/api/files');
-    statsTag.textContent = '模型：' + j.model + ' ｜ 向量库切片：' + (j.stats?.total_chunks ?? 0);
-    fileList.innerHTML = '';
-    if (!j.files || !j.files.length) { emptyFiles.classList.remove('hidden'); return; }
-    emptyFiles.classList.add('hidden');
-    j.files.forEach(f => {
-      const row = document.createElement('div');
-      row.className = 'list-row';
-      row.innerHTML = `<div><div class="fname">📄 ${esc(f.name)}</div>
-        <div class="fmeta">位置：${esc(f.dir === 'contracts' ? '演示库' : '上传库')}</div></div>`;
-      fileList.appendChild(row);
+    folders = j.folders || [];
+    const chunksById = {};
+    (j.stats?.contracts || []).forEach(c => { if (c.contract_id) chunksById[String(c.contract_id)] = c.chunks; });
+    $('statsTag').textContent = `模型：${j.model} ｜ 你的全部合同向量切片合计：${j.stats?.total_chunks ?? 0} 条 ｜ 文件夹 ${folders.length} 个`;
+    const files = j.files || [];
+    const byFolder = {};
+    (files).forEach(f => { (byFolder[f.folder_id] = byFolder[f.folder_id] || []).push(f); });
+    const box = $('libBox');
+    if (!folders.length) { box.innerHTML = '<div class="empty-tip">还没有合同库文件夹，先新建一个吧。</div>'; return; }
+    box.innerHTML = '';
+    folders.forEach(f => {
+      const items = byFolder[f.id] || [];
+      const block = document.createElement('div');
+      block.className = 'folder-block';
+      let rows = '';
+      if (!items.length) {
+        rows = '<div style="color:var(--muted);font-size:12.5px;padding:8px 4px;">（空文件夹）</div>';
+      } else {
+        rows = items.map(it => {
+          const chunks = chunksById[String(it.id)];
+          const del = `<button class="btn btn-ghost" style="padding:3px 10px;font-size:12px;" data-del-contract="${it.id}" data-name="${esc(it.title)}">删除</button>`;
+          return `<div class="crow">
+            <span style="font-size:16px;">📄</span>
+            <div style="min-width:0;">
+              <div class="ct-name">${esc(it.title)}</div>
+              ${it.note ? `<div class="ct-note">💬 ${esc(it.note)}</div>` : ''}
+            </div>
+            <span class="ct-meta">${chunks != null ? chunks + ' 切片' : ''}${it.size ? ' ｜ ' + fmtBytes(it.size) : ''}</span>
+            <select class="crow-move" data-id="${it.id}" style="padding:3px 6px;font-size:12px;width:auto;max-width:150px;">
+              <option value="">⇄ 移到…</option>
+              ${folders.filter(g => g.id !== it.folder_id)
+                       .map(g => `<option value="${g.id}">📁 ${esc(g.name)}</option>`).join('')}
+            </select>
+            ${del}
+          </div>`;
+        }).join('');
+      }
+      block.innerHTML = `
+        <div class="folder-title" data-toggle-folder="${f.id}" style="cursor:pointer;user-select:none;">
+          <span class="caret" style="width:16px;display:inline-block;color:var(--muted);">${openFolders.has(f.id) ? '▾' : '▸'}</span>
+          📁 ${esc(f.name)} <span class="cnt">${items.length} 份合同</span>
+          <button class="btn btn-ghost" style="padding:3px 10px;font-size:12px;" data-del-folder="${f.id}" data-name="${esc(f.name)}" data-cnt="${items.length}">删除文件夹</button>
+        </div>
+        <div class="contract-list${openFolders.has(f.id) ? '' : ' hidden'}">${rows}</div>`;
+      box.appendChild(block);
+    });
+    // 点击文件夹标题 → 展开/收起
+    box.querySelectorAll('[data-toggle-folder]').forEach(t => {
+      t.addEventListener('click', (e) => {
+        if (e.target.closest('[data-del-folder]')) return;  // 点删除按钮不触发折叠
+        const id = Number(t.dataset.toggleFolder);
+        if (openFolders.has(id)) openFolders.delete(id); else openFolders.add(id);
+        const list = t.nextElementSibling;
+        if (list) list.classList.toggle('hidden', !openFolders.has(id));
+        const caret = t.querySelector('.caret');
+        if (caret) caret.textContent = openFolders.has(id) ? '▾' : '▸';
+      });
+    });
+    box.querySelectorAll('[data-del-contract]').forEach(b => {
+      b.onclick = () => {
+        const name = b.dataset.name, id = b.dataset.delContract;
+        confirm2('删除合同', `确定删除合同《${name}》？`, '再次确认：删除后其文件与向量库切片将一并清除，不可恢复。', '删除', async () => {
+          await apiJSON('/api/contracts/' + encodeURIComponent(id), { method: 'DELETE' });
+          loadLibrary();
+        });
+      };
+    });
+    box.querySelectorAll('.crow-move').forEach(sel => {
+      sel.addEventListener('change', async () => {
+        if (!sel.value) return;
+        sel.disabled = true;
+        try {
+          await apiJSON('/api/contracts/' + encodeURIComponent(sel.dataset.id), {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ folder_id: Number(sel.value) }),
+          });
+        } catch (e) { alert(e.message); }
+        await refreshFoldersAll();
+      });
+    });
+    box.querySelectorAll('[data-del-folder]').forEach(b => {
+      b.onclick = () => {
+        const name = b.dataset.name, id = b.dataset.delFolder, cnt = Number(b.dataset.cnt || 0);
+        confirm2('删除文件夹', `确定删除文件夹《${name}》？${cnt ? `其中包含 ${cnt} 份合同将一并删除！` : ''}`, '再次确认：文件夹及其内合同（文件+向量库）将彻底清除，不可恢复。', '删除', async () => {
+          await apiJSON('/api/folders/' + encodeURIComponent(id), { method: 'DELETE' });
+          refreshFoldersAll();
+        });
+      };
     });
   } catch (e) { /* ignore */ }
 }
 
-loadFiles();
+async function refreshFoldersAll() {
+  await loadLibrary();
+  renderFolderSelect('sFolder');
+  renderFolderSelect('zFolder');
+}
+
+$('newFolderBtn').onclick = async () => {
+  const name = $('newFolderName').value.trim();
+  if (!name) { alert('请输入文件夹名称'); return; }
+  $('newFolderBtn').disabled = true;
+  try {
+    await apiJSON('/api/folders', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
+    $('newFolderName').value = '';
+    await refreshFoldersAll();
+  } catch (e) {
+    alert(e.message);
+  } finally {
+    $('newFolderBtn').disabled = false;
+  }
+};
+
+/* ---------------- 恢复：刷新/切页后回来自动续看 ---------------- */
+function maybeRestore() {
+  const raw = sessionStorage.getItem(JOB_KEY);
+  if (!raw) return;
+  let st; try { st = JSON.parse(raw); } catch (e) { return; }
+  apiJSON('/api/jobs/' + encodeURIComponent(st.job) + '/status')
+    .then(s => {
+      if (!s.exists) { sessionStorage.removeItem(JOB_KEY); return; }
+      if (s.status === 'running') {
+        stageName = st.stage; analyzeJobId = st.job;
+        if (st.commit) { formSingle.classList.add('hidden'); formZip.classList.add('hidden'); }
+        connectJob(st.job, st.commit ? 'commit' : 'analyze');
+      } else if (s.status === 'done' && s.payload) {
+        sessionStorage.removeItem(JOB_KEY);
+        stageName = st.stage;
+        // 分析结果仍在 → 直接渲染（入库已完成的任务无需再渲染）
+        if (s.kind === 'ingest_analyze') { analyzeJobId = st.job; renderAnalyzeResult(s.payload); }
+      } else if (s.status === 'error') {
+        sessionStorage.removeItem(JOB_KEY);
+        onJobError(s.error);
+      } else {
+        sessionStorage.removeItem(JOB_KEY);
+      }
+    })
+    .catch(() => {});
+}
+
+window.addEventListener('pagehide', () => {
+  if (es) { es.close(); es = null; }
+});
+
+loadLibrary();
+maybeRestore();
 </script>
 </body>
 </html>

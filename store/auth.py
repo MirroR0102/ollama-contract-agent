@@ -9,7 +9,7 @@ import hmac
 import os
 import secrets
 
-from storage import get_store
+from store.storage import get_store
 
 _PBKDF2_ITER = 200_000
 

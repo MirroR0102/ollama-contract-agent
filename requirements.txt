@@ -15,3 +15,6 @@ uvicorn
 python-multipart
 # ---- 用户系统（MySQL 后端；仅用 sqlite 可去掉） ----
 pymysql
+# ---- 文档接入（多格式入库：docx / 图片 OCR） ----
+python-docx
+rapidocr-onnxruntime

@@ -8,7 +8,7 @@ embedding_client.py —— 本地向量嵌入模型封装（连接经 ollama_con
 自动重建实例（自愈）。vector_store 应通过 get_embedding() 获取「最新」实例
 再绑定进 Chroma，切勿持有固定实例快照（快照在重建后会失效）。
 """
-from ollama_conn import get_emb, reset_emb
+from core.ollama_conn import get_emb, reset_emb
 
 
 def get_embedding():

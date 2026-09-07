@@ -12,7 +12,9 @@
     <nav>
       <a href="/kb" data-page="kb">📚 知识库问答</a>
       <a href="/" data-page="chat">🤖 智能体对话</a>
+      <a href="/draft" data-page="draft">📝 AI 起草</a>
       <a href="/review" data-page="review">📋 合同审查</a>
+      <a href="/inspect" data-page="inspect">📊 合同巡检</a>
       <a href="/ingest" data-page="ingest">📤 合同入库</a>
     </nav>
   </header>
@@ -29,13 +31,16 @@
         </div>
       </div>
 
+      <div class="ctx-row" style="margin-top:8px;">
+        <div id="ctxPicker"></div>
+        <span class="ctx-hint">勾选合同后即作为智能体的「当前处理对象」，无需再在提问里说明；不勾选 = 对全部合同操作</span>
+      </div>
+
+      <div class="scope-bar"><span class="scope-tag" id="scopeTag">📌 当前处理对象：全部合同（未限定）</span></div>
+
       <div class="input-row" style="margin-top:16px;">
         <textarea id="chatInput" rows="2" placeholder="例如：保密协议的保密期限是多久？ / 帮我审查采购合同的风险 / 抽取劳动合同的要素"></textarea>
         <button class="btn btn-primary" id="sendBtn">发送</button>
-      </div>
-      <div class="ctx-row" style="margin-top:8px;">
-        <div id="ctxPicker"></div>
-        <span class="ctx-hint">所选合同作为 Agent 的知识库检索范围（未勾选 = 使用全部合同）</span>
       </div>
       <div style="display:flex;gap:10px;margin-top:10px;align-items:center;">
         <button class="btn btn-ghost" id="newChatBtn">🔄 新对话</button>
@@ -60,14 +65,49 @@ sessionTag.textContent = '会话ID: ' + threadId.slice(0, 12) + '…（多轮记
 
 // 用户选定的上下文合同范围（空数组 = 全部合同）
 let ctxSelected = [];
+
+// 「当前处理对象」常驻提示条：选择合同后无需再在提问里说明对象
+const scopeTag = document.getElementById('scopeTag');
+function refreshScope() {
+  if (!scopeTag) return;
+  if (!ctxSelected.length) {
+    scopeTag.textContent = '📌 当前处理对象：全部合同（未限定）';
+  } else {
+    const names = ctxSelected.join('、');
+    scopeTag.textContent = '📌 当前处理对象：' + ctxSelected.length + ' 份合同 · ' +
+      (names.length > 46 ? names.slice(0, 46) + '…' : names);
+  }
+}
 mountCtxPicker({
   container: document.getElementById('ctxPicker'),
   storageKey: 'chat_ctx_sources',
-  onChange: s => { ctxSelected = s; },
+  onChange: s => { ctxSelected = s; refreshScope(); },
 });
+refreshScope();
 
-// 当前正在生成的 AI 气泡
-let curAi = null;
+// 当前正在生成的 AI 回合
+let curAi = null;    // 干净回答气泡（.msg.ai）
+let curProc = null;  // 思考/工具过程区（小字）
+
+// 最终回答打字机（后端按消息整段发 token，前端逐字打出保持流式观感）
+let typeBuf = '';
+let typeTimer = null;
+function stopTyping() {
+  if (typeTimer) { clearInterval(typeTimer); typeTimer = null; }
+  typeBuf = '';
+}
+function typePush(text) {
+  typeBuf += text;
+  if (!typeTimer) {
+    typeTimer = setInterval(() => {
+      if (!typeBuf) { stopTyping(); return; }
+      const step = Math.min(8, typeBuf.length);
+      const piece = typeBuf.slice(0, step);
+      typeBuf = typeBuf.slice(step);
+      if (curAi) { answerFull += piece; renderAnswer(); }
+    }, 16);
+  }
+}
 
 function addUserMsg(text) {
   const wrap = document.createElement('div');
@@ -77,28 +117,61 @@ function addUserMsg(text) {
   chatBox.scrollTop = chatBox.scrollHeight;
 }
 
-function addAiBubble() {
-  const wrap = document.createElement('div');
-  wrap.className = 'msg ai';
-  wrap.innerHTML = `<div class="avatar">🤖</div><div class="bubble"></div>`;
-  chatBox.appendChild(wrap);
-  curAi = wrap;
+// 每轮 AI 回合 = 上方「过程小字区」+ 下方「干净回答气泡」两部分
+let answerFull = '';   // 当前回答全文（Markdown 渲染用）
+function beginAgentTurn() {
+  stopTyping();
+  answerFull = '';
+  const row = document.createElement('div');
+  row.className = 'agent-turn';
+  row.innerHTML = `
+    <div class="agent-proc hidden">
+      <div class="proc-head">⚙️ Agent 思考与工具过程</div>
+      <div class="proc-body"></div>
+    </div>
+    <div class="msg ai">
+      <div class="avatar">🤖</div>
+      <div class="bubble"></div>
+    </div>`;
+  chatBox.appendChild(row);
+  curAi = row.querySelector('.msg.ai');
   curAi.querySelector('.bubble').classList.add('cursor');
+  const box = row.querySelector('.agent-proc');
+  const body = row.querySelector('.proc-body');
+  // 点标题可折叠/展开过程区
+  row.querySelector('.proc-head').addEventListener('click', () => {
+    body.classList.toggle('hidden');
+  });
+  curProc = { box, body };
   chatBox.scrollTop = chatBox.scrollHeight;
-  return curAi;
 }
 
+// 正文（干净回答）：累积全文并以轻量 Markdown 渲染进气泡（**加粗 / - 列表 / # 标题等）
+function renderAnswer() {
+  if (!curAi) return;
+  curAi.querySelector('.bubble').innerHTML = mdRender(answerFull);
+  chatBox.scrollTop = chatBox.scrollHeight;
+}
 function aiAppend(text) {
-  if (!curAi) addAiBubble();
-  const b = curAi.querySelector('.bubble');
-  b.insertAdjacentText('beforeend', text);
+  if (!curAi) return;
+  answerFull += text;
+  renderAnswer();
+}
+
+// 过程（工具调用/工具结果/模型思考）：小字追加到过程区
+function procLine(html) {
+  if (!curProc) return;
+  curProc.box.classList.remove('hidden');
+  const d = document.createElement('div');
+  d.className = 'proc-line';
+  d.innerHTML = html;
+  curProc.body.appendChild(d);
   chatBox.scrollTop = chatBox.scrollHeight;
 }
 
-function aiChip(html) {
-  if (!curAi) addAiBubble();
-  curAi.querySelector('.bubble').insertAdjacentHTML('beforeend', html);
-  chatBox.scrollTop = chatBox.scrollHeight;
+function shortText(s, n) {
+  s = String(s == null ? '' : s);
+  return s.length > n ? s.slice(0, n) + '…' : s;
 }
 
 async function send() {
@@ -107,30 +180,52 @@ async function send() {
   addUserMsg(message);
   chatInput.value = '';
   sendBtn.disabled = true;
-  addAiBubble();
+  beginAgentTurn();
 
   await streamSSE('/api/chat', { message, thread_id: threadId, sources: ctxSelected }, {
     onEvent(type, payload) {
       if (type === 'tool_call') {
-        aiChip(`<span class="tool-chip">🔧 调用工具：${esc(payload.name)}</span>`);
+        procLine(`🔧 调用工具：<b>${esc(payload.name)}</b>`);
       } else if (type === 'tool_result') {
-        aiChip(`<span class="tool-result-chip">📎 ${esc(payload.text)}</span>`);
+        procLine(`📎 工具结果：<span class="pr-txt">${esc(shortText(payload.text, 160))}</span>`);
+      } else if (type === 'process') {
+        procLine(`💭 ${esc(payload.text || '')}`);
       } else if (type === 'token') {
-        aiAppend(payload.text || '');
+        typePush(payload.text || '');   // 只把最终干净回答以打字机打进正文气泡
       }
     },
     onDone() { finishSend(); },
-    onError(msg) { aiAppend('❌ ' + msg); finishSend(); }
+    onError(msg) { flushType(); aiAppend('❌ ' + msg); finishNow(); }
   });
 }
 
-function finishSend() {
+function flushType() {
+  if (typeTimer) { clearInterval(typeTimer); typeTimer = null; }
+  if (typeBuf && curAi) { answerFull += typeBuf; renderAnswer(); }
+  typeBuf = '';
+}
+
+function finishNow() {
   if (curAi) {
-    const b = curAi.querySelector('.bubble');
-    b.classList.remove('cursor');
+    curAi.querySelector('.bubble').classList.remove('cursor');
   }
+  // 本轮没有任何过程内容（纯闲聊）→ 收起过程区
+  if (curProc && !curProc.box.querySelector('.proc-line')) {
+    curProc.box.classList.add('hidden');
+  }
+  curProc = null;
+  curAi = null;
   sendBtn.disabled = false;
   chatInput.focus();
+}
+
+function finishSend() {
+  // 正常完成：让打字机把剩余文字打完（保持流式观感）再收尾
+  const wait = () => {
+    if (typeBuf || typeTimer) setTimeout(wait, 80);
+    else finishNow();
+  };
+  wait();
 }
 
 chatInput.addEventListener('keydown', e => {

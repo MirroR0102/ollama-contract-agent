@@ -36,12 +36,18 @@ async function apiFetch(url, opts) {
   return resp;
 }
 
-/** 带鉴权的 JSON 请求，失败抛错 */
+/** 带鉴权的 JSON 请求，失败抛错（附带 status 与 detail 供调用方区分） */
 async function apiJSON(url, opts) {
   const r = await apiFetch(url, opts);
   let j = null;
   try { j = await r.json(); } catch (e) { /* ignore */ }
-  if (!r.ok) throw new Error((j && (j.detail || j.message)) || ('请求失败 ' + r.status));
+  if (!r.ok) {
+    const msg = j && (typeof j.detail === 'string' ? j.detail : j.message);
+    const err = new Error(msg || ('请求失败 ' + r.status));
+    err.status = r.status;
+    err.detail = j && j.detail;
+    throw err;
+  }
   return j;
 }
 
@@ -145,6 +151,47 @@ function esc(s) {
   }[c]));
 }
 
+/**
+ * 轻量 Markdown 渲染（安全版：先整体转义再套标签）。
+ * 支持：``` 代码块 / `行内码` / **加粗** / # 标题 / - * 或 1. 列表。
+ * 供智能体回答等流式文本展示使用（模型常输出 **、-、### 等标记）。
+ */
+function mdRender(src) {
+  const h = s => esc(s)
+    .replace(/`([^`\n]+)`/g, (m, c) => '<code>' + c + '</code>')
+    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  const blocks = [];
+  const B = '\u0000';
+  let s = String(src ?? '').replace(/```([\s\S]*?)```/g, (m, c) => {
+    blocks.push(c.replace(/^\n/, '').replace(/\s+$/, ''));
+    return B + 'B' + (blocks.length - 1) + B;
+  });
+  const out = [];
+  let list = null;
+  const flushList = () => {
+    if (list) { out.push('<ul class="md-ul">' + list.map(x => '<li>' + x + '</li>').join('') + '</ul>'); list = null; }
+  };
+  for (const rawLine of s.split('\n')) {
+    const bm = rawLine.match(new RegExp('^' + B + 'B(\\d+)' + B + '$'));
+    if (bm) { flushList(); out.push('<pre class="md-pre">' + esc(blocks[+bm[1]]) + '</pre>'); continue; }
+    const t = rawLine.trim();
+    if (!t) { flushList(); continue; }
+    const hm = t.match(/^(#{1,4})\s+(.*)$/);
+    if (hm) {
+      flushList();
+      const lv = Math.min(4, hm[1].length + 2);
+      out.push('<div class="md-h md-h' + lv + '">' + h(hm[2]) + '</div>');
+      continue;
+    }
+    if (/^[-*•]\s+/.test(t)) { (list = list || []).push(h(t.replace(/^[-*•]\s+/, ''))); continue; }
+    if (/^\d+[.、)]\s+/.test(t)) { (list = list || []).push(h(t.replace(/^\d+[.、)]\s+/, ''))); continue; }
+    flushList();
+    out.push('<div class="md-p">' + h(t) + '</div>');
+  }
+  flushList();
+  return out.join('');
+}
+
 /** 生成随机会话 id */
 function newThreadId() { return 'web_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 
@@ -199,11 +246,23 @@ function mountCtxPicker(cfg) {
   apiJSON('/api/files').then(j => {
     const files = (j && j.files) || [];
     if (!files.length) { listEl.innerHTML = '<div class="ctx-empty">你的合同库为空，请先到「合同入库」页导入</div>'; return; }
-    listEl.innerHTML = files.map(f =>
-      `<label class="ctx-item"><input type="checkbox" value="${esc(f.name)}">` +
-      `<span class="ctx-fname">📄 ${esc(f.name)}</span>` +
-      `<span class="ctx-fdir">${esc(f.dir === 'contracts' ? '演示' : '上传')}</span></label>`
-    ).join('');
+    // 按所属文件夹分组展示（每文件夹一个小标题）
+    const groups = new Map();
+    files.forEach(f => {
+      const k = f.folder_name || '未分组';
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(f);
+    });
+    let html = '';
+    groups.forEach((arr, name) => {
+      html += `<div class="ctx-fgroup">📁 ${esc(name)}（${arr.length}）</div>`;
+      html += arr.map(f =>
+        `<label class="ctx-item"><input type="checkbox" value="${esc(f.name)}">` +
+        `<span class="ctx-fname">📄 ${esc(f.name)}</span>` +
+        `<span class="ctx-fdir">${esc(f.dir === 'contracts' ? '演示' : '上传')}</span></label>`
+      ).join('');
+    });
+    listEl.innerHTML = html;
     refreshPanel();
   }).catch(() => { listEl.innerHTML = '<div class="ctx-empty">加载合同清单失败</div>'; });
 
@@ -233,5 +292,7 @@ function mountCtxPicker(cfg) {
   });
 
   refreshLabel();
+  // 初始化后主动同步一次：让页面在「刷新/重开」后立即恢复上次勾选（如处理对象提示条）
+  if (cfg.onChange) cfg.onChange(selected.slice());
   return { get: () => selected.slice() };
 }

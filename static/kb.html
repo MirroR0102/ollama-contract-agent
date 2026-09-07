@@ -12,7 +12,9 @@
     <nav>
       <a href="/kb" data-page="kb">📚 知识库问答</a>
       <a href="/" data-page="chat">🤖 智能体对话</a>
+      <a href="/draft" data-page="draft">📝 AI 起草</a>
       <a href="/review" data-page="review">📋 合同审查</a>
+      <a href="/inspect" data-page="inspect">📊 合同巡检</a>
       <a href="/ingest" data-page="ingest">📤 合同入库</a>
     </nav>
   </header>
@@ -20,12 +22,23 @@
   <main class="container">
     <div class="card">
       <div class="page-title">📚 知识库问答</div>
-      <div class="page-sub">基于本地 Chroma 向量库检索合同原文，严格依据证据回答（无幻觉），适合查询具体条款。默认使用全部已入库合同，也可在上方勾选特定合同限定检索范围。</div>
+      <div class="page-sub">多智能体流水线：🤔 追问澄清 → 🔍 向量检索 → 🧐 证据校验 → ✍️ 依据证据作答。严格依据合同原文（无幻觉），适合精确查询条款；可勾选合同限定检索范围。</div>
 
       <div class="ctx-row">
         <div id="ctxPicker"></div>
-        <span class="ctx-hint">仅以所选合同为上下文作答（未勾选 = 使用全部合同）</span>
+        <span class="ctx-hint">勾选合同后仅以所选合同为上下文作答（不勾选 = 使用全部合同）</span>
       </div>
+      <div class="scope-bar"><span class="scope-tag" id="scopeTag">📌 当前检索范围：全部合同（未限定）</span></div>
+
+      <div class="q-suggest">
+        <span class="q-label">💡 试试快速问：</span>
+        <button type="button" class="q-chip">违约金怎么约定的？</button>
+        <button type="button" class="q-chip">保密期限是多久？</button>
+        <button type="button" class="q-chip">付款分几期？怎么支付？</button>
+        <button type="button" class="q-chip">争议如何解决？</button>
+      </div>
+
+      <div class="kb-stage hidden" id="kbStage"></div>
 
       <div class="input-row">
         <textarea id="question" rows="2" placeholder="例如：采购合同的付款分几期？违约金怎么约定？"></textarea>
@@ -46,73 +59,210 @@ const askBtn = document.getElementById('askBtn');
 const qInput = document.getElementById('question');
 const resultBox = document.getElementById('resultBox');
 const emptyTip = document.getElementById('emptyTip');
+const kbStage = document.getElementById('kbStage');
 
 // 用户选定的上下文合同范围（空数组 = 全部合同）
 let ctxSelected = [];
+
+// 「当前检索范围」提示条（与智能体对话页一致）
+const scopeTag = document.getElementById('scopeTag');
+function refreshScope() {
+  if (!scopeTag) return;
+  if (!ctxSelected.length) scopeTag.textContent = '📌 当前检索范围：全部合同（未限定）';
+  else {
+    const names = ctxSelected.join('、');
+    scopeTag.textContent = '📌 当前检索范围：' + ctxSelected.length + ' 份合同 · ' +
+      (names.length > 46 ? names.slice(0, 46) + '…' : names);
+  }
+}
 mountCtxPicker({
   container: document.getElementById('ctxPicker'),
   storageKey: 'kb_ctx_sources',
-  onChange: s => { ctxSelected = s; },
+  onChange: s => { ctxSelected = s; refreshScope(); },
 });
+refreshScope();
+
+// 快捷问题引导按钮
+function bindQuickChips() {
+  document.querySelectorAll('.q-chip').forEach(b => b.addEventListener('click', () => {
+    qInput.value = (b.textContent || '').trim();
+    ask();
+  }));
+}
+
+// 阶段状态行（小字，展示多智能体流水线进度）
+function setStage(text) {
+  kbStage.classList.remove('hidden');
+  kbStage.textContent = text;
+}
+function hideStage() { kbStage.classList.add('hidden'); kbStage.textContent = ''; }
 
 // 当前回答的 DOM 引用
 let answerBubble = null;
+let kbAnswer = '';   // 回答全文（Markdown 渲染用）
+function renderKbAnswer() {
+  if (answerBubble) answerBubble.innerHTML = mdRender(kbAnswer);
+}
+
+// 证据（分页 + 校验徽章 + 剔除折叠）
+let evItems = [];   // 校验保留的证据（high/medium）
+let evDrops = [];   // 校验剔除的证据（drop）
+let evPage = 0;
+let evBox = null, evHead = null, evBody = null, evPrev = null, evNext = null;
 
 function resetUI() {
   resultBox.innerHTML = '';
   emptyTip.classList.add('hidden');
-  // 占位回答气泡容器（证据框在其上方动态插入）
-  const wrap = document.createElement('div');
-  wrap.className = 'chat';
-  wrap.innerHTML = `
+  hideStage();
+  evItems = []; evDrops = []; evPage = 0;
+  // 回答气泡（上方）
+  const chat = document.createElement('div');
+  chat.className = 'chat';
+  chat.innerHTML = `
     <div class="msg ai">
       <div class="avatar">🤖</div>
       <div class="bubble"></div>
     </div>`;
-  resultBox.appendChild(wrap);
-  answerBubble = wrap.querySelector('.bubble');
+  resultBox.appendChild(chat);
+  answerBubble = chat.querySelector('.bubble');
   answerBubble.classList.add('cursor');
+  // 证据分页区（下方，收到证据后显示）
+  const ev = document.createElement('div');
+  ev.className = 'kb-evidence hidden';
+  ev.innerHTML = `
+    <div class="ev-head"><span class="ev-title">📎 检索证据（智能体已校验）</span><span class="ev-page"></span></div>
+    <div class="ev-body"></div>
+    <div class="ev-nav">
+      <button type="button" class="btn btn-ghost ev-prev">‹ 上一条</button>
+      <button type="button" class="btn btn-ghost ev-next">下一条 ›</button>
+    </div>
+    <div class="ev-drops hidden">
+      <button type="button" class="btn btn-ghost ev-drops-toggle"></button>
+      <div class="ev-drops-list hidden"></div>
+    </div>`;
+  resultBox.appendChild(ev);
+  evBox = ev; evHead = ev.querySelector('.ev-head'); evBody = ev.querySelector('.ev-body');
+  evPrev = ev.querySelector('.ev-prev'); evNext = ev.querySelector('.ev-next');
+  evPrev.addEventListener('click', () => { if (evPage > 0) { evPage--; renderEvPage(); } });
+  evNext.addEventListener('click', () => { if (evPage < evItems.length - 1) { evPage++; renderEvPage(); } });
 }
 
-function appendEvidence(item) {
-  const box = document.createElement('div');
-  box.className = 'evidence-item';
-  box.innerHTML = `<span class="src">📎 证据 ${item.index}｜来源：${esc(item.source)}</span>${esc(item.content)}`;
-  // 证据框插到回答之前
-  const chat = resultBox.querySelector('.chat');
-  resultBox.insertBefore(box, chat);
+function relBadge(rel) {
+  if (rel === 'high') return '<span class="rel-tag rel-high">✅ 高相关</span>';
+  if (rel === 'medium') return '<span class="rel-tag rel-medium">🟡 可参考</span>';
+  return '<span class="rel-tag rel-drop">🚫 已剔除</span>';
+}
+
+function renderEvPage() {
+  if (!evItems.length) return;
+  evBox.classList.remove('hidden');
+  const it = evItems[evPage];
+  evHead.querySelector('.ev-page').textContent = (evPage + 1) + ' / ' + evItems.length;
+  const reason = it.reason ? `<div class="ev-reason">🧐 校验意见：${esc(it.reason)}</div>` : '';
+  evBody.innerHTML =
+    `<div class="evidence-item"><span class="src">📎 来源：${esc(it.source)} ${relBadge(it.relevance)}</span>${esc(it.content)}${reason}</div>`;
+  evPrev.disabled = evPage <= 0;
+  evNext.disabled = evPage >= evItems.length - 1;
+  renderDrops();
+}
+
+function renderDrops() {
+  if (!evDrops.length) { evBox.querySelector('.ev-drops').classList.add('hidden'); return; }
+  const area = evBox.querySelector('.ev-drops');
+  area.classList.remove('hidden');
+  const toggle = area.querySelector('.ev-drops-toggle');
+  const list = area.querySelector('.ev-drops-list');
+  toggle.textContent = '🚫 证据校验已剔除 ' + evDrops.length + ' 条不相关/重复证据（点此查看）';
+  list.innerHTML = evDrops.map(d =>
+    `<div class="evidence-item ev-drop-item"><span class="src">📎 ${esc(d.source)} ${relBadge('drop')}${d.reason ? '｜' + esc(d.reason) : ''}</span>${esc(d.content)}</div>`).join('');
+  toggle.onclick = () => list.classList.toggle('hidden');
+}
+
+function setEvidence(items) {
+  const all = (items || []).filter(x => x && (x.content || '').trim());
+  evItems = all.filter(x => x.relevance !== 'drop');
+  evDrops = all.filter(x => x.relevance === 'drop');
+  evPage = 0;
+  if (evItems.length) renderEvPage();
+  else if (evDrops.length) { evBox.classList.remove('hidden'); renderDrops(); }
+}
+
+// —— 追问澄清回合 ——
+function showClarify(question, orig) {
+  resultBox.innerHTML = '';
+  emptyTip.classList.add('hidden');
+  setStage('🤔 追问澄清智能体：需要先明确一下问题…');
+  const chat = document.createElement('div');
+  chat.className = 'chat';
+  chat.innerHTML = `<div class="msg ai"><div class="avatar">🤖</div>
+    <div class="bubble">想先跟你确认一下：${esc(question)}</div></div>`;
+  resultBox.appendChild(chat);
+  const row = document.createElement('div');
+  row.className = 'clarify-row';
+  row.innerHTML = `<input id="clarifyInput" placeholder="例如：保密协议_sample.txt 或具体维度…" />
+    <button type="button" class="btn btn-primary" id="clarifyBtn">继续</button>`;
+  resultBox.appendChild(row);
+  const inp = row.querySelector('#clarifyInput');
+  const btn = row.querySelector('#clarifyBtn');
+  const go = () => {
+    const ans = inp.value.trim();
+    runQuery(ans ? `${orig}（范围补充：${ans}）` : orig);
+  };
+  inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
+  btn.addEventListener('click', go);
+  inp.focus();
+}
+
+// —— 正式检索问答（流水线 SSE） ——
+async function runQuery(question) {
+  resetUI();
+  kbAnswer = '';
+  setStage('🤖 知识库问答智能体已启动…');
+  await streamSSE('/api/kb/query', { question, sources: ctxSelected }, {
+    onEvent(type, payload) {
+      if (type === 'stage') setStage(payload.text || '');
+      else if (type === 'evidence') setEvidence(payload.items);
+      else if (type === 'token' || type === 'message') {
+        kbAnswer += payload.text || '';
+        renderKbAnswer();
+      }
+    },
+    onDone() { finishAnswer(); },
+    onError(msg) { kbAnswer += '❌ ' + msg; renderKbAnswer(); finishAnswer(); }
+  });
 }
 
 async function ask() {
   const question = qInput.value.trim();
-  if (!question) { qInput.focus(); return; }
+  if (!question || askBtn.disabled) { if (!question) qInput.focus(); return; }
   askBtn.disabled = true;
   resetUI();
-
-  await streamSSE('/api/kb/query', { question, sources: ctxSelected }, {
-    onEvent(type, payload) {
-      if (type === 'evidence') {
-        (payload.items || []).forEach(appendEvidence);
-      } else if (type === 'token') {
-        answerBubble.textContent += payload.text || '';
-      } else if (type === 'message') {
-        answerBubble.textContent += payload.text || '';
-      }
-    },
-    onDone() { finishAnswer(); },
-    onError(msg) { answerBubble.textContent = '❌ ' + msg; finishAnswer(); }
-  });
+  setStage('🧠 追问澄清智能体正在判断问题是否需要澄清…');
+  let need = false, cq = '';
+  try {
+    const c = await apiJSON('/api/kb/clarify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question, sources: ctxSelected }),
+    });
+    need = !!(c && c.need);
+    cq = (c && c.question) || '';
+  } catch (e) { need = false; }
+  if (need && cq) { showClarify(cq, question); return; }
+  runQuery(question);
 }
 
 function finishAnswer() {
-  answerBubble.classList.remove('cursor');
+  if (answerBubble) answerBubble.classList.remove('cursor');
   askBtn.disabled = false;
+  setTimeout(hideStage, 900);
 }
 
 qInput.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(); }
 });
 askBtn.addEventListener('click', ask);
+bindQuickChips();
 </script>
 </body>
 </html>

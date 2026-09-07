@@ -20,31 +20,45 @@
 | ⑦ 网页版 ⭐ | FastAPI 封装全部能力 + SSE 流式，浏览器四页面交互 | 服务化封装 / 流式接口 |
 | ⑧ 用户系统 ⭐ | 注册/登录 + MySQL 合同库归属 + Chroma owner 多租户隔离，各账号合同库完全独立 | 数据库设计 / 认证 / 权限隔离 |
 
-## 二、目录结构
+## 二、目录结构（分层：core 底层 → store 数据 → agent 业务/服务）
 
 ```
 ollama_contract_agent/
-├── .env / .env.example      # Ollama / MySQL 配置（.env 含密码不入库）
-├── requirements.txt         # 依赖清单
-├── config.py                # 全局配置（模型/向量库/审查维度/数据库）
-├── storage.py               # 存储层：MySQL / SQLite 双后端（用户 + 合同归属）
-├── auth.py                  # 用户认证：PBKDF2 密码哈希 + token 会话
-├── bootstrap.py             # 启动初始化：预置 demo 账号、演示合同归户入库
-├── embedding_client.py      # 本地嵌入模型封装（OllamaEmbeddings）
-├── document_loader.py       # 文档加载与智能分块（txt/pdf）
-├── vector_store.py          # Chroma 向量库：入库/去重/检索/统计/清空
-├── contract_kb.py           # 知识库 RAG 问答（本地 ChatOllama）
-├── contract_analyzer.py     # 合同 8 维度智能审查引擎
-├── element_extractor.py     # 合同关键要素结构化抽取
-├── tools.py                 # @tool 工具集（供 Agent 调用）
-├── agent_run.py             # LangGraph 记忆 Agent 交互对话
-├── main.py                  # 系统菜单入口（答辩演示用）
-├── app.py                   # 网页版后端（FastAPI + SSE 流式接口）
-├── static/                  # 网页前端（登录 + kb/对话/审查/入库 五页面）
-├── uploads/                 # 网页上传的合同（不入库 git）
-├── WEB_PLAN.md              # 网页版开发方案
-└── contracts/               # 演示合同文档（3 份样例，可自行替换）
+├── app.py / main.py          # 入口薄壳：python app.py(网页) / python main.py(命令行)
+├── .env / .env.example       # Ollama / MySQL 配置（.env 含密码不入库）
+├── requirements.txt          # 依赖清单
+├── core/                     # ① 底层：配置与大模型/向量连接
+│   ├── config.py             #   全局配置（模型/向量库/审查维度/数据库）
+│   ├── ollama_conn.py        #   Ollama 连接管理 + 失效自动重建（自愈）
+│   └── embedding_client.py   #   本地嵌入模型封装（OllamaEmbeddings）
+├── store/                    # ② 数据存取层
+│   ├── storage.py            #   存储双后端：MySQL / SQLite（用户/文件夹/合同归属）
+│   ├── auth.py               #   用户认证：PBKDF2 密码哈希 + token 会话
+│   ├── bootstrap.py          #   启动初始化：demo 账号、演示合同归户、暂存认领
+│   ├── session_context.py    #   会话 thread → 用户 / 上下文合同范围
+│   ├── document_loader.py    #   txt/pdf 加载与中文合同智能分块
+│   ├── docparse.py           #   多格式解析：txt/pdf/docx/图片OCR/zip
+│   └── vector_store.py       #   Chroma 向量库：按 owner+contract_id 域隔离/检索/删除
+├── agent/                    # ③ 业务与智能体层
+│   ├── contract_kb.py        #   知识库 RAG 问答（无幻觉）
+│   ├── contract_analyzer.py  #   合同 8 维度智能审查引擎
+│   ├── element_extractor.py  #   合同关键要素结构化抽取
+│   ├── intake_agent.py       #   文档接入智能体（多格式识别 + 压缩包切分）
+│   ├── tools.py              #   @tool 工具集（供 Agent 调用）
+│   ├── agent_run.py          #   LangGraph 记忆 Agent（对话智能体）
+│   ├── jobs.py               #   后台任务引擎（SSE 进度/暂停/恢复）
+│   ├── app.py                #   FastAPI 网页服务（全部 API）
+│   └── main.py               #   命令行演示菜单（CLI）
+├── static/                   # 网页前端（登录 + kb/对话/审查/入库 五页面）
+├── uploads/                  # 网页上传的合同 + 暂存区（不入库 git）
+├── contracts/                # 演示合同文档（3 份样例）
+├── WEB_PLAN.md               # 网页版开发方案
+└── chroma_db/                # 本地向量库（运行时生成，不入库 git）
 ```
+
+> 包内模块使用绝对导入（`from core.config import ...` / `from store.x import ...` /
+> `from agent.x import ...`）；请在项目根目录运行入口脚本（`./chroma_db`、`./contracts`
+> 为相对当前工作目录路径）。
 
 ## 三、环境准备（模型导入指引）
 

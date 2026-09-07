@@ -46,7 +46,8 @@ class Job:
         self.dim_name = ""
         self.text = ""            # 当前阶段的流式文本快照
         self.results = []         # review：已完成的维度结果
-        self.payload = None       # extract：最终结构化结果
+        self.payload = None       # extract/ingest：最终结构化结果
+        self._stage_ver = 0       # ingest：阶段进度文本版本（供 SSE 发 stage 事件）
         # 订阅与保活
         self.subscribers = 0
         self.last_seen = time.time()
@@ -111,6 +112,12 @@ class Job:
         with self._lock:
             self.last_seen = time.time()
 
+    def set_stage(self, text: str):
+        """设置任务阶段进度文字（ingest 类任务用，覆盖式）。"""
+        with self._lock:
+            self.text = text or ""
+            self._stage_ver += 1
+
     # ---------- 中止判定 ----------
     def should_stop(self):
         """运行中的任务是否应停止：被手动中止，或判定用户已离开。"""
@@ -153,11 +160,16 @@ class Job:
                 }))
             last["index"] = self.index
             last["textlen"] = 0  # 新阶段文本从零重新计数
-        # ③ 流式文本增量（属于当前维度）
-        t = self.text or ""
-        if len(t) > last["textlen"]:
-            evs.append(("token", {"text": t[last["textlen"]:]}))
-            last["textlen"] = len(t)
+        # ③ 流式文本增量（属于当前维度；ingest 任务走 set_stage，不走 token）
+        if self.kind not in ("ingest_analyze", "ingest_commit", "inspect"):
+            t = self.text or ""
+            if len(t) > last["textlen"]:
+                evs.append(("token", {"text": t[last["textlen"]:]}))
+                last["textlen"] = len(t)
+        # ④ ingest 阶段文字（覆盖式）
+        if self._stage_ver != last.get("sver", 0):
+            evs.append(("stage", {"text": self.text or ""}))
+            last["sver"] = self._stage_ver
         # 状态变化
         if self.status != last["status"]:
             last["status"] = self.status
@@ -176,6 +188,7 @@ class Job:
             "index": self.index,
             "dim_name": self.dim_name,
             "text": self.text or "",
+            "stage_ver": self._stage_ver,
             "results": list(self.results),
             "payload": self.payload,
         }
@@ -189,7 +202,8 @@ _jobs = {}
 _jobs_lock = threading.Lock()
 
 
-def create_job(kind: str, filename: str, target, owner: str = None) -> Job:
+def create_job(kind: str, filename: str, target, owner: str = None,
+               payload=None) -> Job:
     with _jobs_lock:
         # 清理已完成旧任务，防止无限增长
         if len(_jobs) > 50:
@@ -198,6 +212,8 @@ def create_job(kind: str, filename: str, target, owner: str = None) -> Job:
                 if j.status != "running" and now - j.last_seen > 3600:
                     _jobs.pop(j.id, None)
         job = Job(kind, filename, target, owner=owner)
+        if payload is not None:
+            job.payload = payload
         _jobs[job.id] = job
         job.start()
         return job
