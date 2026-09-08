@@ -67,11 +67,53 @@ def _scope_text(sources) -> str:
     return ("、".join(sources)) if sources else "全部合同"
 
 
-def need_clarify(question: str, sources=None, model_lock=None) -> dict:
+# 条款类查询特征词：命中即说明“问的是具体条款约定”，此类问题在“多合同+未点名”时必须澄清
+_CLAUSE_HINT = (
+    "违约金|赔偿|保密|付款|支付|争议|管辖|仲裁|诉讼|解除|终止|解除权"
+    "|知识产权|责任|免责|质保|期限|金额|价款|价格|验收|生效|通知方式"
+    "|怎么约定|如何约定|怎么算|是多少|是多久|分几期|怎么支付|责任上限"
+)
+
+
+def _rule_clarify(question: str, sources, contract_names) -> str:
+    """规则层兜底：检索范围=全部合同、库内≥2 份、条款类问题、且问题没点名任何合同
+    → 必须澄清。返回澄清问句；不需要澄清时返回空字符串。
+    （此层是确定性规则，不受小模型判断波动影响，保证“该澄清时必澄清”。）"""
+    names = [n for n in (contract_names or []) if n]
+    if sources or len(names) < 2:
+        return ""
+    q = (question or "").strip()
+    if not q:
+        return ""
+    # 明确是对“所有 / 全部合同”层面的提问 → 不用澄清
+    if re.search(r"(所有|全部|每一|每份|每个|各个|各份)合同", q) or "分别" in q:
+        return ""
+    ql = q.lower()
+    # 问题点名了库内某合同（全名 / 去扩展名 / 核心片段简写）→ 不用澄清
+    for n in names:
+        base = re.sub(r"\.[a-z0-9]+$", "", n, flags=re.I)
+        core = re.sub(r"(_?sample|合同|协议|\.txt|\.pdf)$", "", base, flags=re.I)
+        cands = {n.lower(), base.lower()}
+        if len(core) >= 4:
+            cands.add(core.lower())
+        if any(c and c in ql for c in cands):
+            return ""
+    if re.search(_CLAUSE_HINT, q):
+        return (f"当前知识库共有 {len(names)} 份合同，您没有指定要查询哪一份，"
+                f"而不同合同的该条款约定可能不同。请输入合同名称（例如：{names[0]}），"
+                f"或从下方列表中选择。")
+    return ""
+
+
+def need_clarify(question: str, sources=None, model_lock=None, contract_names=None) -> dict:
     """追问澄清智能体：判断是否需要反问。返回 {"need": bool, "question": str}。
+    先跑确定性规则层（该澄清的场景不依赖小模型自觉）；再交由模型判断更微妙的歧义。
     模型调用失败或输出无法解析时，保守返回 need=False（不打扰用户，直接检索）。"""
     if not (question or "").strip():
         return {"need": False, "question": ""}
+    rule_q = _rule_clarify(question, sources, contract_names)
+    if rule_q:
+        return {"need": True, "question": rule_q}
     prompt = _CLARIFY_PROMPT.format(scope=_scope_text(sources), question=question)
     try:
         text = stream_generate(prompt, echo=False)

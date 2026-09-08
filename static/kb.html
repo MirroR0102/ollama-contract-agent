@@ -188,7 +188,19 @@ function setEvidence(items) {
 }
 
 // —— 追问澄清回合 ——
-function showClarify(question, orig) {
+function matchContract(ans, cands) {
+  // 尽量把用户输入匹配到库内某份合同：精确名 → 去扩展名 → 唯一包含匹配
+  if (!cands || !ans) return null;
+  const a = ans.trim().toLowerCase();
+  if (!a) return null;
+  let hit = cands.find(n => n.toLowerCase() === a);
+  if (hit) return hit;
+  hit = cands.find(n => n.replace(/\.[a-z0-9]+$/i, '').toLowerCase() === a);
+  if (hit) return hit;
+  const hits = cands.filter(n => n.toLowerCase().includes(a));
+  return hits.length === 1 ? hits[0] : null;
+}
+function showClarify(question, orig, cands) {
   resultBox.innerHTML = '';
   emptyTip.classList.add('hidden');
   setStage('🤔 追问澄清智能体：需要先明确一下问题…');
@@ -199,17 +211,39 @@ function showClarify(question, orig) {
   resultBox.appendChild(chat);
   const row = document.createElement('div');
   row.className = 'clarify-row';
-  row.innerHTML = `<input id="clarifyInput" placeholder="例如：保密协议_sample.txt 或具体维度…" />
+  row.innerHTML = `<input id="clarifyInput" placeholder="输入合同名称后回车…" />
     <button type="button" class="btn btn-primary" id="clarifyBtn">继续</button>`;
   resultBox.appendChild(row);
   const inp = row.querySelector('#clarifyInput');
   const btn = row.querySelector('#clarifyBtn');
+  // 锁定检索范围到指定合同后，用原始问题重新走检索问答
+  const lockScopeTo = (name) => {
+    if (name && !ctxSelected.includes(name)) {
+      ctxSelected = ctxSelected.length === 0 ? [name] : [...ctxSelected, name];
+    }
+    refreshScope();
+  };
   const go = () => {
     const ans = inp.value.trim();
+    if (ans) {
+      const hit = matchContract(ans, cands);
+      if (hit) { lockScopeTo(hit); runQuery(orig); return; }
+    }
     runQuery(ans ? `${orig}（范围补充：${ans}）` : orig);
   };
   inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
   btn.addEventListener('click', go);
+  // 可点选的合同候选（点击即锁定范围并重问）
+  if (cands && cands.length) {
+    const candBox = document.createElement('div');
+    candBox.className = 'clarify-cands';
+    candBox.innerHTML = `<span class="hint">或选择要查询的合同：</span>` +
+      cands.map(n => `<button type="button" class="clarify-chip" data-name="${esc(n)}">📄 ${esc(n)}</button>`).join('');
+    resultBox.appendChild(candBox);
+    candBox.querySelectorAll('.clarify-chip').forEach(c => {
+      c.addEventListener('click', () => { lockScopeTo(c.dataset.name); runQuery(orig); });
+    });
+  }
   inp.focus();
 }
 
@@ -238,7 +272,7 @@ async function ask() {
   askBtn.disabled = true;
   resetUI();
   setStage('🧠 追问澄清智能体正在判断问题是否需要澄清…');
-  let need = false, cq = '';
+  let need = false, cq = '', cands = [];
   try {
     const c = await apiJSON('/api/kb/clarify', {
       method: 'POST',
@@ -247,8 +281,9 @@ async function ask() {
     });
     need = !!(c && c.need);
     cq = (c && c.question) || '';
+    cands = (c && Array.isArray(c.cands)) ? c.cands : [];
   } catch (e) { need = false; }
-  if (need && cq) { showClarify(cq, question); return; }
+  if (need && cq) { showClarify(cq, question, cands); return; }
   runQuery(question);
 }
 

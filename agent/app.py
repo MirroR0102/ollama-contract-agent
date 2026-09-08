@@ -298,11 +298,19 @@ class ClarifyBody(BaseModel):
 @app.post("/api/kb/clarify")
 def api_kb_clarify(body: ClarifyBody, user: dict = Depends(current_user)):
     """追问澄清智能体：判断问题是否模糊/歧义、需要先反问澄清一轮。
-    返回 {"need": bool, "question": str}；need=false 时前端直接走检索问答。"""
+    返回 {"need": bool, "question": str, "cands": [合同名...]}；
+    need=false 时前端直接走检索问答；cands 供前端做“点选合同”的澄清交互。"""
     if not _try_lock():
         raise HTTPException(status_code=429, detail=_BUSY_MSG)
     try:
-        return kb_clarify((body.question or "").strip(), body.sources or None)
+        store = get_store()
+        rows = store.list_contracts(user["id"]) or []
+        names = [r.get("store_name") or r.get("name") for r in rows]
+        names = [n for n in names if n]
+        res = kb_clarify((body.question or "").strip(), body.sources or None,
+                         contract_names=names)
+        res["cands"] = names
+        return res
     finally:
         MODEL_LOCK.release()
 
