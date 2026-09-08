@@ -465,6 +465,41 @@ def _collapse_artifact_echo(text: str) -> str:
     return t
 
 
+def _strip_review_json_stream(text: str) -> str:
+    """去掉最终回答里模型复述的“审查维度 JSON 流”（形如
+    {"risk_level":...,"evidence":...,"opinion":...}，一段或多段连续），
+    保留真正要点总结，避免 JSON 泄漏 + 内容两遍。非此类文本原样返回。"""
+    t = text or ""
+    if '"risk_level"' not in t or '"opinion"' not in t:
+        return t
+    out = []
+    i, n = 0, len(t)
+    changed = False
+    while i < n:
+        if t[i] == "{":
+            end = _balanced_json_end(t, i)
+            if end == -1:
+                out.append(t[i])
+                i += 1
+                continue
+            block = t[i:end]
+            if '"risk_level"' in block and '"opinion"' in block:
+                changed = True  # 丢弃该 JSON 块
+                i = end
+                continue
+            out.append(block)
+            i = end
+            continue
+        out.append(t[i])
+        i += 1
+    res = "".join(out)
+    res = re.sub(r"[ \t]{2,}", " ", res)
+    res = re.sub(r"\n{3,}", "\n\n", res).strip()
+    if changed:
+        return res or "（审查结果见上方工具过程，已整理为要点。）"
+    return text
+
+
 # ---------------- 伪工具调用文本 → 真实工具执行（兜底） ----------------
 # 7B 模型偶尔不输出原生 function call，而是把调用写成文本，例如：
 #   )( ((extract_contract_elements_tool {"contract_name": "xxx.pdf"})))
@@ -705,6 +740,7 @@ def api_chat(body: ChatBody, user: dict = Depends(current_user)):
         try:
             session_context.set_owner(body.thread_id, user["username"])
             session_context.set_sources(body.thread_id, body.sources or None)
+            session_context.set_question(body.thread_id, body.message)
             system_prompt = _chat_system_prompt(body.thread_id)
             # 兜底：最终回答若没自带「处理范围」声明，前端可读到的正文也会以它开头
             _srcs = session_context.get_sources(body.thread_id)
@@ -741,7 +777,8 @@ def api_chat(body: ChatBody, user: dict = Depends(current_user)):
                                 # 模型把工具调用写成了文本（伪调用）→ 后端翻译成真实执行，不再展示乱码
                                 pass
                             else:
-                                send("process" if msg_tool else "token", {"text": txt})
+                                out_txt = _strip_review_json_stream(txt) if not msg_tool else txt
+                                send("process" if msg_tool else "token", {"text": out_txt})
                     msg_tool = False
 
                 for chunk, metadata in agent.stream(

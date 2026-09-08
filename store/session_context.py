@@ -17,6 +17,8 @@ _lock = threading.Lock()
 _thread_sources: dict = {}
 # thread_id -> 归属用户名 | None（Web 端必填；None=不隔离，命令行单用户用）
 _thread_owner: dict = {}
+# thread_id -> 最近一次用户问题文本（供 analyze 等工具按问题推断维度）
+_thread_question: dict = {}
 _MAX_THREADS = 500
 
 
@@ -32,6 +34,23 @@ def set_sources(thread_id: str, sources):
             for k in list(_thread_sources)[:100]:
                 _thread_sources.pop(k, None)
                 _thread_owner.pop(k, None)
+                _thread_question.pop(k, None)
+
+
+def set_question(thread_id: str, question: str):
+    """记录某会话最近一次用户问题（供工具按问题推断审查维度）。"""
+    if not thread_id:
+        return
+    with _lock:
+        _thread_question[thread_id] = question or ""
+
+
+def get_question(thread_id: str):
+    """返回某会话最近一次用户问题（可能为空字符串）。"""
+    if not thread_id:
+        return ""
+    with _lock:
+        return _thread_question.get(thread_id, "")
 
 
 def set_owner(thread_id: str, owner):

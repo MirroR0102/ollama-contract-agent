@@ -16,6 +16,7 @@ from langchain_core.runnables import RunnableConfig
 from agent.contract_analyzer import analyze_contract, _list_contract_files
 from agent.contract_kb import stream_generate
 from agent.element_extractor import extract_elements
+from core.config import REVIEW_DIMENSIONS
 from core.ollama_conn import retry_emb_call
 from store import bootstrap, docparse, session_context
 from store.storage import get_store
@@ -29,6 +30,57 @@ def _thread_ctx(config: RunnableConfig):
         return None, None
     return (session_context.get_owner(thread_id),
             session_context.get_sources(thread_id))
+
+
+def _thread_id_of(config: RunnableConfig) -> str:
+    """从工具运行时 config 取 thread_id（可能为空）。"""
+    if not config:
+        return ""
+    return (config.get("configurable") or {}).get("thread_id") or ""
+
+
+def _normalize_dims(raw_dims) -> list:
+    """把模型传入的 focus_dimensions（可能不精确）规范化为标准维度名列表。"""
+    out: list = []
+    if not raw_dims:
+        return out
+    for d in str(raw_dims).split(","):
+        d = d.strip().strip("，、;； ")
+        if not d:
+            continue
+        matched = None
+        for dim in REVIEW_DIMENSIONS:
+            name = dim["name"]
+            if name == d or d in name or name in d:
+                matched = name
+                break
+        if matched is None:
+            # 别名（query 里的词）匹配
+            for dim in REVIEW_DIMENSIONS:
+                if any(len(kw) >= 2 and kw in d
+                       for kw in re.split(r"[、，,;；]", dim.get("query", ""))):
+                    matched = dim["name"]
+                    break
+        if matched and matched not in out:
+            out.append(matched)
+    return out
+
+
+def _guess_dims_from_question(question: str) -> list:
+    """按用户问题文本推断其关注的审查维度（未命中返回空=全部维度）。"""
+    q = question or ""
+    if not q.strip():
+        return []
+    out: list = []
+    for dim in REVIEW_DIMENSIONS:
+        name = dim["name"]
+        if name in q:
+            out.append(name)
+            continue
+        if any(len(kw) >= 2 and kw in q
+               for kw in re.split(r"[、，,;；]", dim.get("query", ""))):
+            out.append(name)
+    return out
 
 
 def _owner_files(owner: str) -> list:
@@ -189,11 +241,18 @@ def analyze_contract_tool(contract_name: str, focus_dimensions: str = "",
     path = bootstrap.resolve_user_file(owner, row.get("store_name") or row.get("name") or "")
     if not path:
         return f"合同文件在磁盘上不存在（可能已被删除）：《{row.get('name')}》"
-    dims = [d.strip() for d in focus_dimensions.split(",") if d.strip()] or None
+    # 维度确定：模型明确给了 focus_dimensions → 规范化；
+    # 没给 → 按用户本次问题文本推断（避免问“知识产权风险”却跑全部 8 维）；
+    # 仍推不出 → 全部维度（用户未指定方向）
+    dims = _normalize_dims(focus_dimensions)
+    if not dims:
+        thread_id = _thread_id_of(config)
+        dims = _guess_dims_from_question(
+            session_context.get_question(thread_id) if thread_id else "")
     try:
         # 被 Agent 调用时静默执行（stream=False），结果由 Agent 汇总返回
-        results = analyze_contract(path, dims=dims, progress=False, stream=False,
-                                   owner=owner)
+        results = analyze_contract(path, dims=dims or None, progress=False,
+                                   stream=False, owner=owner)
     except Exception as e:  # noqa: BLE001
         return f"审查失败：{e}"
     lines = [f"《{os.path.basename(path)}》审查结果："]
