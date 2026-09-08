@@ -378,10 +378,33 @@ class ChatBody(BaseModel):
 
 
 @app.post("/api/chat")
+# ---------- 要素抽取工具：把工具结果整合为可下载 JSON ----------
+_EXTRACT_TOOL = "extract_contract_elements_tool"
+
+
+def _parse_tool_lines(text: str) -> dict:
+    """把要素抽取工具返回的 “- 字段: 值” 行文本还原为 dict；解析不出返回 {}。"""
+    data = {}
+    if not text:
+        return data
+    for ln in str(text).splitlines():
+        ln = ln.strip()
+        if not ln.startswith("- "):
+            continue
+        body = ln[2:]
+        if ":" in body:
+            k, v = body.split(":", 1)
+            k = k.strip()
+            v = v.strip()
+            if k and v:
+                data[k] = v
+    return data
+
+
 def api_chat(body: ChatBody, user: dict = Depends(current_user)):
     """Agent 多轮对话：登记会话归属与合同范围；Ollama 断连自动重建 Agent 重试。
     流式事件分两类：
-      process / tool_call / tool_result —— 思考与工具过程（前端小字展示）
+      process / tool_call / tool_result / download —— 思考与工具过程（前端小字展示）
       token —— 最终干净回答（前端正文气泡展示）
     """
 
@@ -473,7 +496,26 @@ def api_chat(body: ChatBody, user: dict = Depends(current_user)):
                             emitted = True
                             buf.append(text)
                     elif isinstance(chunk, ToolMessage):
-                        send("tool_result", {"text": str(text)[:200]})
+                        _raw = str(text)
+                        _tname = (getattr(chunk, "name", "") or "")
+                        _is_extract = (_tname == _EXTRACT_TOOL
+                                       or (_raw.startswith("《") and "关键要素" in _raw[:60]))
+                        if (_is_extract
+                                and not _raw.startswith(("抽取失败", "你的合同库中未找到"))):
+                            _elements = _parse_tool_lines(_raw)
+                            if len(_elements) >= 2:
+                                # 抽取成功：不把原始键值刷屏，改提示 + 生成可下载 JSON 文件
+                                send("tool_result", {
+                                    "text": "✓ 关键要素抽取完成，结构化结果已整理为可下载的 JSON 文件（见下方下载卡片）。"})
+                                send("download", {
+                                    "label": "合同关键要素",
+                                    "filename": "合同要素_" + time.strftime("%Y%m%d_%H%M%S") + ".json",
+                                    "content": json.dumps(_elements, ensure_ascii=False, indent=2),
+                                })
+                            else:
+                                send("tool_result", {"text": _raw[:200]})
+                        else:
+                            send("tool_result", {"text": _raw[:200]})
                         emitted = True
                 finalize_model()  # 流结束：最后一条 model 消息（闲聊 / 最终回答）
                 return emitted

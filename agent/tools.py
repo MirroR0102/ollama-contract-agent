@@ -333,7 +333,7 @@ def summarize_contract_tool(contract_name: str, config: RunnableConfig) -> str:
     row = _resolve_contract_row(owner, contract_name)
     if row is None:
         return f"未找到《{contract_name}》。当前可用合同：\n{_contract_hint(owner)}"
-    text, err = _read_contract_text(owner, row, max_chars=8000)
+    text, err = _read_contract_text(owner, row, max_chars=16000)
     if err:
         return err
     prompt = (
