@@ -95,6 +95,13 @@ def is_conn_error(exc) -> bool:
 
     注意：显存不足/模型崩溃等其它错误不在此列，会如实上抛并提示用户。
     """
+    # ① errno 判定（最可靠）：10061 连接被拒 / 10054 连接重置 / 10053 中止 / 10060 超时
+    eno = getattr(exc, "errno", None)
+    if eno in (10061, 10054, 10053, 10060, 11001, 10051):
+        return True
+    # ② 异常类型判定（连接类异常直接命中）
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
     msg = str(exc)
     low = msg.lower()
     keys = (
@@ -114,6 +121,18 @@ def is_conn_error(exc) -> bool:
         "llama-server process has terminated",
         "ollama is not running",
         "connect failed",
+        # 中文 Windows 系统错误（WinError 10061/10054 等）：
+        "winerror 10061",
+        "winerror 10054",
+        "winerror 10053",
+        "winerror 10060",
+        "winerror 10051",
+        "积极拒绝",
+        "无法连接",
+        "连接被重置",
+        "连接被拒绝",
+        "远程主机强迫关闭",
+        "由于目标计算机积极拒绝",
     )
     return any(k in low for k in keys)
 
