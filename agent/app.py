@@ -377,7 +377,6 @@ class ChatBody(BaseModel):
     sources: list[str] = []  # 上下文合同范围（空 = 全部合同）
 
 
-@app.post("/api/chat")
 # ---------- 要素抽取工具：把工具结果整合为可下载 JSON ----------
 _EXTRACT_TOOL = "extract_contract_elements_tool"
 
@@ -401,6 +400,7 @@ def _parse_tool_lines(text: str) -> dict:
     return data
 
 
+@app.post("/api/chat")
 def api_chat(body: ChatBody, user: dict = Depends(current_user)):
     """Agent 多轮对话：登记会话归属与合同范围；Ollama 断连自动重建 Agent 重试。
     流式事件分两类：
