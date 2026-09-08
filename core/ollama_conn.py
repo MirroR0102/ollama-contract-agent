@@ -32,8 +32,11 @@ def _build_llm():
         base_url=OLLAMA_HOST,
         model=LLM_MODEL_NAME,
         temperature=0,
-        num_ctx=4096,      # 与原配置一致：控制上下文窗口，防 6GB 显存溢出
-        num_predict=2048,  # 与原配置一致：限制单次最长输出
+        # 上下文窗口：原为 4096，无法容纳约万字合同全文（抽取/摘要/审查需送 ~1 万字），
+        # 超窗时模型会截断输入并出现“重复输出两遍”等退化；qwen2.5:7b 支持 32k，提到 16384
+        num_ctx=16384,
+        num_predict=2048,  # 单次最长输出（足够回答问题；过长明细走文件/工具结果展示）
+        repeat_penalty=1.15,  # 抑制长文本/低温度下的自我重复（ollama 参数，经 ChatOllama 透传）
         request_timeout=_REQUEST_TIMEOUT,
     )
 

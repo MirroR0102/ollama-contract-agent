@@ -194,10 +194,11 @@ async function send() {
         // 工具产物（如要素抽取 JSON）：聊天框内提供文件下载按钮
         const dname = payload.filename || 'elements.json';
         const dlabel = payload.label || '合同要素 JSON';
+        const ext = (dname.match(/\.[a-z0-9]+$/i) || ['.json'])[0];
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = 'dl-json';
-        btn.textContent = '📄 下载 ' + dlabel + '（.json）';
+        btn.textContent = '📄 下载 ' + dlabel + '（' + ext + '）';
         btn.addEventListener('click', () => {
           const blob = new Blob([payload.content || ''], { type: 'application/json;charset=utf-8' });
           const url = URL.createObjectURL(blob);

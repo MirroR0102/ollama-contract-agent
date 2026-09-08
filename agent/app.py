@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from store import auth, bootstrap, docparse, session_context
 from agent.agent_run import _SYSTEM_PROMPT, build_agent
+from agent import tools as agent_tools
 from agent.contract_analyzer import REVIEW_DIMENSIONS, analyze_dimension
 from agent.contract_kb import _KB_PROMPT, _format_context, stream_generate
 from agent.draft_agent import draft as ai_draft
@@ -408,6 +409,260 @@ def _parse_tool_lines(text: str) -> dict:
     return data
 
 
+def _collapse_artifact_echo(text: str) -> str:
+    """把产出型工具（抽取/摘要）轮次里 Agent 的“完整复述 + 精炼复述”折叠为一遍。
+
+    7B 模型拿到摘要/抽取工具返回后，常先完整复述一遍（长），再给一份精炼要点（短）。
+    这里用两个确定性信号折叠（仅产出型工具轮次调用，普通对话不受影响）：
+      1) 剥掉被完整复述的 JSON 键值块（抽取场景先贴 JSON 再列要点）；
+      2) 找到“…如下/…如下：”引导句：若其后段落（精炼）明显短于其前段落（完整复述），
+         保留“处理范围”首行 + 引导句之后的精炼内容。
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    # —— 1) 剥掉 JSON 键值复述块（如 {"合同类型": ...}）——
+    s = t.find("{")
+    if s >= 0:
+        depth = 0
+        end = -1
+        for i in range(s, len(t)):
+            if t[i] == "{":
+                depth += 1
+            elif t[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end > s and end - s > 20:
+            block = t[s:end + 1]
+            if block.count("{") == 1 and '"' in block and ":" in block:
+                rest = (t[:s] + t[end + 1:]).strip()
+                if rest:
+                    return _collapse_artifact_echo(rest)
+                return t[:s].strip()
+    # —— 2) 结构性锚点重复切分（不依赖措辞，兼容“明细见下载文件”等说法）——
+    # 完整复述里每个小节标题会在第二遍再出现一次；取最早“第二次出现”处为分割点，
+    # 若其后（第二遍，通常更精炼）明显短于其前（完整复述），则保留处理范围行 + 第二遍。
+    _anchors = ("合同类型", "签约当事人", "当事人", "出租方（甲方）", "承租方（乙方）",
+                "核心内容", "主要风险点", "关键要素", "租赁房屋", "合同金额", "履行期限",
+                "明细", "要点", "风险点", "甲方：", "乙方：")
+    pos2 = None
+    for mk in _anchors:
+        idx = t.find(mk)
+        if idx < 0:
+            continue
+        idx2 = t.find(mk, idx + len(mk))
+        if idx2 > 0 and (pos2 is None or idx2 < pos2):
+            pos2 = idx2
+    if pos2 and pos2 > 60:
+        head = t[:pos2].strip()
+        tail = t[pos2:].strip()
+        # 仅当“第二遍”明显短于“第一遍”时折叠（避免误伤本就一遍的长回答）
+        if tail and len(tail) * 3 < len(head) * 2:
+            keep = "\n".join(l for l in head.split("\n") if "处理范围" in l)
+            return ((keep + "\n\n") if keep else "") + tail
+    return t
+
+
+# ---------------- 伪工具调用文本 → 真实工具执行（兜底） ----------------
+# 7B 模型偶尔不输出原生 function call，而是把调用写成文本，例如：
+#   )( ((extract_contract_elements_tool {"contract_name": "xxx.pdf"})))
+#   或 langchain 风格 {"name": "compare_contracts_tool", "arguments": {...}}（前后常带乱码/标记）
+# 后端解析这段文本并真正执行对应工具，避免乱码当回答、功能不执行。
+_TOOL_MAP = None
+
+
+def _get_tool_map() -> dict:
+    global _TOOL_MAP
+    if _TOOL_MAP is None:
+        _TOOL_MAP = {t.name: t for t in agent_tools.ALL_TOOLS}
+    return _TOOL_MAP
+
+
+def _balanced_json_end(s: str, start: int) -> int:
+    """从 start（假定指向 '{'）做花括号配平，返回 JSON 结束下标+1；失败返回 -1。"""
+    depth = 0
+    in_str = False
+    esc = False
+    for k in range(start, len(s)):
+        c = s[k]
+        if esc:
+            esc = False
+            continue
+        if c == "\\":
+            esc = True
+            continue
+        if c == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return k + 1
+    return -1
+
+
+def _try_langchain_json_call(text: str):
+    """识别 langchain 风格的工具调用 JSON（可能被乱码/<tool_call> 等文字包裹）：
+    {"name": "<工具名>", "arguments": {...}} 或 {"name": "...", "args": {...}}。
+    兼容 name 值漏写引号的“宽松 JSON”（qwen 常见：{"name": summarize_contract_tool, ...}）。
+    命中返回 (name, args)；否则 None。"""
+    t = text or ""
+    # 宽松 JSON：把 {"name": bareName, ...} 修正为 {"name": "bareName", ...} 再按标准解析
+    t2 = re.sub(r'\{\s*"name"\s*:\s*([A-Za-z_][A-Za-z0-9_]*)\s*,',
+                lambda mm: '{"name": "' + mm.group(1) + '",', t)
+    for m in re.finditer(r'\{\s*"name"\s*:\s*"([A-Za-z_][A-Za-z0-9_]*)"', t2):
+        name = m.group(1)
+        if name not in _get_tool_map():
+            continue
+        end = _balanced_json_end(t2, m.start())
+        if end == -1:
+            continue
+        try:
+            obj = json.loads(t2[m.start():end])
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(obj, dict):
+            continue
+        args = obj.get("arguments")
+        if not isinstance(args, dict):
+            args = obj.get("args")
+        if not isinstance(args, dict):
+            continue
+        return name, args
+    return None
+
+
+def _parse_pseudo_tool_call(text: str):
+    """尝试把“伪工具调用”文本解析为 (工具名, 参数字典)；不是伪调用则返回 None。"""
+    t = (text or "").strip()
+    if not t:
+        return None
+    # ① langchain 风格 JSON 工具调用（含参数）——最常用且可精确校验
+    lc = _try_langchain_json_call(t)
+    if lc:
+        return lc
+    # ② 剥掉 <tool_call> 标记，丢掉与调用无关的前缀行（📌处理范围、乱码/思考草稿），
+    #    定位“工具名”起始行；若整段都不是工具调用则交给后续正则判定返回 None。
+    t = re.sub(r"</?tool_call>?", "", t)
+    lines = t.splitlines()
+    start_idx = 0
+    for k, ln in enumerate(lines):
+        s = ln.strip()
+        if not s:
+            continue
+        if re.match(r"^[\s()（）【】<>]*[A-Za-z_][A-Za-z0-9_]*(\s*\{|\s*\(\s*\{|\s*\(|\s*$)", s):
+            break  # 该行是工具调用起点（允许 )( (( 等少量包裹符前缀）
+        start_idx = k + 1  # 前缀噪音行（乱码 / 范围声明）丢弃
+    t = "\n".join(lines[start_idx:]).strip()
+    if not t:
+        return None
+    # 剥掉首尾包裹符号与空白（qwen 有时输出 )( ((name {...})) )）
+    t = t.strip(" \t\r\n()（）【】<>")
+    m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\{|\{\s*)", t)
+    if m:
+        name = m.group(1)
+    else:
+        m2 = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*$", t)
+        if not m2:
+            return None
+        name = m2.group(1)
+    if name not in _get_tool_map():
+        return None
+    args = {}
+    # 尝试解析参数 JSON（{...} 或 (...)")  —— 用配平截取，避免贪婪吞掉后续正文
+    js = t.find("{")
+    if js != -1:
+        je = _balanced_json_end(t, js)
+        if je == -1:
+            jm = None
+        else:
+            jm = (js, je)
+    else:
+        jm = None
+    if jm:
+        seg = t[jm[0]:jm[1]]
+        try:
+            cand = json.loads(seg)
+            if isinstance(cand, dict):
+                args = cand
+        except Exception:  # noqa: BLE001
+            pass
+    # 无参数工具调用：整条就是纯工具名（允许少量包裹符）→ 直接命中
+    if jm is None:
+        return name, {}
+    # 带参数：校验主体应基本就是“工具名 + {参数}”，残余自然语言太多则不算伪调用
+    cleaned = (t[:jm[0]] + t[jm[1]:]).strip()
+    if m:
+        cleaned = cleaned.replace(m.group(0), "").strip()
+    cleaned = cleaned.strip("()（） \t\r\n<>/")
+    # 排除工具名本体后，若仍残留较多自然语言 → 不算纯伪调用
+    rem = cleaned.replace(name, "", 1).strip("()（） \t\r\n<>/")
+    if rem and len(rem) > 20:
+        return None
+    return name, args
+
+
+def _emit_artifact_file(tool_name: str, raw: str, send) -> bool:
+    """产出型工具（抽取/摘要）结果 → 下载卡片事件；返回是否已按产出交付。"""
+    _ts = time.strftime("%Y%m%d_%H%M%S")
+    if tool_name == "extract_contract_elements_tool" or \
+            (raw.startswith("《") and "关键要素" in raw[:60]):
+        _elements = _parse_tool_lines(raw)
+        if len(_elements) >= 2:
+            send("tool_result", {
+                "text": "✓ 关键要素抽取完成，结构化结果已整理为可下载的 JSON 文件（见下方下载卡片）。"})
+            send("download", {
+                "label": "合同关键要素",
+                "filename": "合同要素_" + _ts + ".json",
+                "content": json.dumps(_elements, ensure_ascii=False, indent=2),
+            })
+            return True
+    elif tool_name == "summarize_contract_tool" or \
+            (raw.startswith("《") and "摘要" in raw[:60]):
+        send("tool_result", {
+            "text": "✓ 合同摘要已生成，完整内容见下方「下载」卡片（过程区仅作提示，不再刷长文）。"})
+        send("download", {
+            "label": "合同摘要",
+            "filename": "合同摘要_" + _ts + ".md",
+            "content": raw,
+        })
+        return True
+    return False
+
+
+def _try_pseudo_tool_fulfill(text: str, thread_id: str, send) -> bool:
+    """若文本是伪工具调用 → 真实执行对应工具并交付结果；返回是否已处理（不再展示原文）。"""
+    parsed = _parse_pseudo_tool_call(text)
+    if not parsed:
+        return False
+    name, args = parsed
+    tool = _get_tool_map().get(name)
+    if tool is None:
+        return False
+    try:
+        cfg = {"configurable": {"thread_id": thread_id}}
+        result = tool.invoke(args, config=cfg)
+        raw = str(result)
+    except Exception as e:  # noqa: BLE001
+        send("tool_result", {
+            "text": f"工具「{name}」自动执行失败（参数可能不完整）：{str(e)[:150]}"})
+        return True
+    if _emit_artifact_file(name, raw, send):
+        send("token", {
+            "text": f"已为你直接执行「{name}」，结构化结果见上方下载卡片。如需基于结果继续解读，请告诉我。"})
+    else:
+        # 非产出型工具（检索/审查/对比/定位…）：结果本身就是用户要的内容 → 完整发到正文
+        send("tool_result", {"text": f"已为你自动执行「{name}」，执行结果见下方正文。"})
+        send("token", {"text": raw[:2600]})
+    return True
+
+
 @app.post("/api/chat")
 def api_chat(body: ChatBody, user: dict = Depends(current_user)):
     """Agent 多轮对话：登记会话归属与合同范围；Ollama 断连自动重建 Agent 重试。
@@ -466,6 +721,8 @@ def api_chat(body: ChatBody, user: dict = Depends(current_user)):
                 buf: list = []        # 当前 model 消息的文本缓冲
                 msg_tool = False      # 当前 model 消息是否已带工具调用
                 prev_node = None
+                final_tokens: list = []  # 产出型工具轮次：缓冲最终回答（流结束后去重折叠再发）
+                artifact_round = False   # 本轮是否已产出可下载文件（抽取/摘要）
 
                 def finalize_model():
                     """当前 model 消息结束：带工具 → 文字为思考草稿（process）；
@@ -477,7 +734,14 @@ def api_chat(body: ChatBody, user: dict = Depends(current_user)):
                         if txt:
                             if not msg_tool and "处理范围" not in txt[:24]:
                                 txt = scope_line + "\n\n" + txt
-                            send("process" if msg_tool else "token", {"text": txt})
+                            if not msg_tool and artifact_round:
+                                # 产出型工具轮次：先缓冲，流结束后统一折叠（去掉“完整复述”那段）
+                                final_tokens.append(txt)
+                            elif not msg_tool and _try_pseudo_tool_fulfill(txt, body.thread_id, send):
+                                # 模型把工具调用写成了文本（伪调用）→ 后端翻译成真实执行，不再展示乱码
+                                pass
+                            else:
+                                send("process" if msg_tool else "token", {"text": txt})
                     msg_tool = False
 
                 for chunk, metadata in agent.stream(
@@ -512,24 +776,45 @@ def api_chat(body: ChatBody, user: dict = Depends(current_user)):
                         _tname = (getattr(chunk, "name", "") or "")
                         _is_extract = (_tname == _EXTRACT_TOOL
                                        or (_raw.startswith("《") and "关键要素" in _raw[:60]))
-                        if (_is_extract
-                                and not _raw.startswith(("抽取失败", "你的合同库中未找到"))):
+                        _is_summarize = (_tname == "summarize_contract_tool"
+                                         or (_raw.startswith("《") and "摘要" in _raw[:60]))
+                        _failed = _raw.startswith(("抽取失败", "审查失败", "未找到",
+                                                   "你的合同库中未找到"))
+                        _ts = time.strftime("%Y%m%d_%H%M%S")
+                        if _is_extract and not _failed:
                             _elements = _parse_tool_lines(_raw)
                             if len(_elements) >= 2:
-                                # 抽取成功：不把原始键值刷屏，改提示 + 生成可下载 JSON 文件
+                                # 抽取成功：不刷原始键值，提示 + 可下载 JSON 文件
                                 send("tool_result", {
                                     "text": "✓ 关键要素抽取完成，结构化结果已整理为可下载的 JSON 文件（见下方下载卡片）。"})
                                 send("download", {
                                     "label": "合同关键要素",
-                                    "filename": "合同要素_" + time.strftime("%Y%m%d_%H%M%S") + ".json",
+                                    "filename": "合同要素_" + _ts + ".json",
                                     "content": json.dumps(_elements, ensure_ascii=False, indent=2),
                                 })
+                                artifact_round = True
                             else:
                                 send("tool_result", {"text": _raw[:200]})
+                        elif _is_summarize and not _failed:
+                            # 摘要成功：完整内容整理为可下载文本文件（小字区只预览提示）
+                            send("tool_result", {
+                                "text": "✓ 合同摘要已生成，完整内容见下方「下载」卡片（过程区仅作提示，不再刷长文）。"})
+                            send("download", {
+                                "label": "合同摘要",
+                                "filename": "合同摘要_" + _ts + ".md",
+                                "content": _raw,
+                            })
+                            artifact_round = True
                         else:
                             send("tool_result", {"text": _raw[:200]})
                         emitted = True
                 finalize_model()  # 流结束：最后一条 model 消息（闲聊 / 最终回答）
+                # 产出型工具轮次：最终回答去掉“完整复述”，只保留精炼内容后再推送
+                if artifact_round and final_tokens:
+                    collapsed = _collapse_artifact_echo("".join(final_tokens))
+                    if collapsed:
+                        send("token", {"text": collapsed})
+                        emitted = True
                 return emitted
 
             emitted = False

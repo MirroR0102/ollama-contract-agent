@@ -8,6 +8,7 @@ tools.py —— 自定义工具集（供 Agent 自主调用）
   4. list_contract_files        查看库内可用合同清单
 """
 import os
+import re
 
 from langchain.tools import tool
 from langchain_core.runnables import RunnableConfig
@@ -52,6 +53,83 @@ def _resolve_agent_path(contract_name: str, owner: str):
     return contract_name
 
 
+# ================= 检索兜底：数值/条款类问题的全文关键词扫描 =================
+# 「XX多少 / XX是什么 / 违约金 / 押金」等问句仅靠语义向量检索时，长合同里
+# 的数字条款（如租金、违约金、期限）可能召回不到，导致模型“没查到就答不出”。
+# 这里从问句中提取关键词，若语义检索片段里完全没有这些词，就退化为逐行全文扫描
+# （确定性、不依赖嵌入质量），把命中的原文行号与上下文附加给模型。
+_QUERY_NUM_RE = re.compile(
+    r"([\u4e00-\u9fa5A-Za-z]{1,6}?)(?:多少|多少钱|金额|怎么收|收费标准|几|是什么|何种|为何|多久)")
+_TERM_HINTS = [
+    "违约金", "押金", "保证金", "租金", "物业费", "付款", "保密", "期限", "管辖",
+    "争议", "仲裁", "责任", "赔偿", "金额", "费用", "工资", "社保", "试用期",
+    "服务费", "利息", "递增", "退还", "解除", "逾期", "税率", "增值税", "发票",
+    "折扣", "续租", "转租", "争议解决",
+]
+_STOP_CORE = re.compile(
+    r"(合同|协议|里面|的|中|请问|帮我|看看|一下|这个|那份|所有|我|他|它|内容|都|有什么)")
+
+
+def _keywords_from_query(query: str) -> list:
+    """从问句中提取用于全文扫描的关键词（最多 4 个）。"""
+    kws: list = []
+    for m in _QUERY_NUM_RE.finditer(query or ""):
+        w = (m.group(1) or "").strip()
+        if len(w) >= 1 and not _STOP_CORE.search(w) and w not in kws:
+            kws.append(w)
+    for t in _TERM_HINTS:
+        if t in (query or "") and t not in kws:
+            kws.append(t)
+    return kws[:4]
+
+
+def _keyword_scan_fallback(query: str, owner, sources: list, max_total: int = 8,
+                           ctx_lines: int = 2) -> str:
+    """对当前范围内合同逐行扫描 query 关键词，返回原文命中片段（带行号）。"""
+    kws = [k.lower() for k in _keywords_from_query(query)]
+    if not kws:
+        return ""
+    rows: list = []
+    try:
+        if owner:
+            u = get_store().get_user_by_name(owner)
+            if u:
+                rows = get_store().list_contracts(u["id"])
+    except Exception:  # noqa: BLE001
+        rows = []
+    if sources:
+        rows = [r for r in rows if (r.get("store_name") or "") in sources]
+    results: list = []
+    for r in rows:
+        store_name = r.get("store_name") or r.get("name") or ""
+        if not store_name:
+            continue
+        try:
+            path = bootstrap.resolve_user_file(owner, store_name)
+            if not path:
+                continue
+            parsed = docparse.parse_plain_file(path)
+        except Exception:  # noqa: BLE001
+            continue
+        lines = (parsed.get("text") or "").splitlines()
+        for i, ln in enumerate(lines):
+            low = ln.lower()
+            if any(k in low for k in kws):
+                ctx = "\n".join(x.strip()[:150]
+                                for x in lines[max(0, i - ctx_lines): i + ctx_lines + 1])
+                results.append((r.get("name") or store_name, i + 1, ctx))
+                if len(results) >= max_total:
+                    break
+        if len(results) >= max_total:
+            break
+    if not results:
+        return ""
+    out = ["\n[全文关键词扫描补充（逐行命中原文，供核对数值/条款）]"]
+    for name, ln, ctx in results:
+        out.append(f"\n──《{name}》第 {ln} 行──\n{ctx}")
+    return "\n".join(out)
+
+
 @tool
 def search_contract_knowledge(query: str, config: RunnableConfig) -> str:
     """
@@ -76,6 +154,17 @@ def search_contract_knowledge(query: str, config: RunnableConfig) -> str:
     parts = []
     for i, d in enumerate(docs, 1):
         parts.append(f"[来源：{d.metadata.get('source', '未知')}｜片段{i}]\n{d.page_content}")
+    # 兜底：语义检索片段完全不含问题关键词时（长合同数字条款常召回不到），
+    # 用全文逐行扫描补上真实原文，避免“模型没证据只能答查无”。
+    kws = _keywords_from_query(query)
+    if kws:
+        hit_in_docs = any(
+            any(k in (getattr(d, "page_content", "") or "") for k in kws)
+            for d in docs)
+        if not hit_in_docs:
+            scan = _keyword_scan_fallback(query, owner, sources)
+            if scan:
+                parts.append(scan)
     return "\n\n".join(parts)
 
 @tool
@@ -90,12 +179,16 @@ def analyze_contract_tool(contract_name: str, focus_dimensions: str = "",
         focus_dimensions: 重点关注的风险维度，逗号分隔，可留空（默认全部维度）
     """
     owner, _sources = _thread_ctx(config)
-    path = _resolve_agent_path(contract_name, owner)
-    if path is None:
+    # 用统一解析（含下划线/空格/扩展名归一化容错），再取磁盘真实文件名
+    row = _resolve_contract_row(owner, contract_name)
+    if row is None:
         files = _owner_files(owner)
         hint = "\n".join(f"- {f}" for f in files) if files else "（空）"
         return (f"你的合同库中未找到《{contract_name}》。当前可用合同：\n{hint}\n"
                 f"请用准确的合同文件名重试。")
+    path = bootstrap.resolve_user_file(owner, row.get("store_name") or row.get("name") or "")
+    if not path:
+        return f"合同文件在磁盘上不存在（可能已被删除）：《{row.get('name')}》"
     dims = [d.strip() for d in focus_dimensions.split(",") if d.strip()] or None
     try:
         # 被 Agent 调用时静默执行（stream=False），结果由 Agent 汇总返回
@@ -123,12 +216,16 @@ def extract_contract_elements_tool(contract_name: str,
         contract_name: 当前账户合同库中的合同文件名（如：保密协议_sample.txt，可只写部分名称）
     """
     owner, _sources = _thread_ctx(config)
-    path = _resolve_agent_path(contract_name, owner)
-    if path is None:
+    # 用统一解析（含下划线/空格/扩展名归一化容错），再取磁盘真实文件名
+    row = _resolve_contract_row(owner, contract_name)
+    if row is None:
         files = _owner_files(owner)
         hint = "\n".join(f"- {f}" for f in files) if files else "（空）"
         return (f"你的合同库中未找到《{contract_name}》。当前可用合同：\n{hint}\n"
                 f"请用准确的合同文件名重试。")
+    path = bootstrap.resolve_user_file(owner, row.get("store_name") or row.get("name") or "")
+    if not path:
+        return f"合同文件在磁盘上不存在（可能已被删除）：《{row.get('name')}》"
     try:
         # 被 Agent 调用时静默执行（stream=False）
         data = extract_elements(path, stream=False)
@@ -159,8 +256,14 @@ def list_contract_files_tool(config: RunnableConfig) -> str:
 
 
 # ================= 工具 5-10：统计 / 元信息 / 文件夹 / 条款定位 / 摘要 / 对比 =================
+def _norm_name(s: str) -> str:
+    """文件名归一化：去扩展名、去下划线/空格/连字符，用于宽松匹配。"""
+    s = re.sub(r"\.(pdf|docx?|txt|md)$", "", (s or "").strip(), flags=re.I)
+    return re.sub(r"[\s_\-—]+", "", s).lower()
+
+
 def _resolve_contract_row(owner: str, name: str):
-    """把用户给的名称解析为该用户的合同记录：store_name 精确 → 标题唯一 → 前缀唯一。"""
+    """把用户给的名称解析为该用户的合同记录：store_name 精确 → 标题唯一 → 前缀唯一 → 归一化宽松。"""
     if not owner:
         return None
     store = get_store()
@@ -182,6 +285,19 @@ def _resolve_contract_row(owner: str, name: str):
                 or (r.get("store_name") or "").startswith(name))]
     if len(hits) == 1:
         return hits[0]
+    # 归一化容错：模型/用户常把文件名里的下划线去掉（如“练习用办公楼宇租赁合同约万字.pdf”
+    # 对应磁盘名“练习用_办公楼宇租赁合同_约万字.pdf”），忽略下划线/空格/扩展名后宽松匹配
+    nr = _norm_name(name)
+    if nr:
+        hits = []
+        for r in rows:
+            rn = _norm_name(r.get("name") or "")
+            rs = _norm_name(r.get("store_name") or "")
+            if (rn and (rn.startswith(nr) or nr.startswith(rn))) \
+                    or (rs and (rs.startswith(nr) or nr.startswith(rs))):
+                hits.append(r)
+        if len(hits) == 1:
+            return hits[0]
     return None
 
 
