@@ -16,7 +16,7 @@ import re
 
 from langchain_core.messages import HumanMessage
 
-from core.ollama_conn import get_llm, retry_llm_call
+from core.llm_provider import get_llm, retry_llm_call
 from store import docparse
 
 # 单文件放入一份“候选合同”的文本上限（超长直接截断，防止入库前上下文爆炸）

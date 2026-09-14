@@ -4,7 +4,7 @@ agent_run.py —— 带记忆的合同审查 Agent（LangGraph 实现）
 - 使用 LangChain 1.0 标准 create_agent 构建工具型智能体
 - MemorySaver 实现多轮对话短期上下文记忆（thread_id 隔离不同会话）
 - Agent 自主判断何时调用工具（知识库检索 / 合同审查 / 要素抽取 / 文件清单）
-- 全程本地 Ollama 推理，断网可用
+- 推理引擎双模：默认本地 Ollama（断网可用），可在网页端切换为云端 API
 """
 from langchain.agents import create_agent
 from langchain_core.messages import (
@@ -18,7 +18,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from agent.tools import ALL_TOOLS
 from core.config import LLM_MODEL_NAME
-from core.ollama_conn import get_llm
+from core.llm_provider import get_llm, get_provider
 
 # 初始化会话记忆检查点（短期上下文记忆：同一 thread 记住多轮对话）
 memory = MemorySaver()
@@ -140,7 +140,8 @@ def chat_once(user_input: str, thread_id: str = "user_001") -> str:
 def interactive(thread_id: str = "user_001") -> None:
     """交互式多轮对话（答辩主入口，全程流式）。输入 exit 退出。"""
     print("=" * 60)
-    print(f"  🤖 合同智能体已就绪  |  模型：{LLM_MODEL_NAME}")
+    _engine = "云端 API" if get_provider() == "cloud" else "本地 Ollama"
+    print(f"  🤖 合同智能体已就绪  |  引擎：{_engine} · 模型：{LLM_MODEL_NAME}")
     print("  你可以问：条款内容 / 审查合同风险 / 抽取合同要素 / 有哪些合同")
     print("  输入 exit 退出对话")
     print("=" * 60)

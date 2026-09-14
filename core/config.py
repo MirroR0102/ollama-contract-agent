@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 config.py —— 全局统一配置读取
-从 .env 读取 Ollama 服务地址、模型名、向量库与分块参数，
-所有模块通过 from config import ... 使用同一份配置。
+从 .env 读取 本地 Ollama / 云端大模型（OpenAI 兼容）服务地址与模型名、
+向量库与分块参数，所有模块通过 from config import ... 使用同一份配置。
 """
 import os
 import sys
@@ -21,10 +21,23 @@ for _stream in (sys.stdout, sys.stderr):
 # 加载项目根目录 .env 配置（所有运行入口均从项目根启动）
 load_dotenv()
 
-# ---------- Ollama 服务配置 ----------
+# ---------- Ollama 服务配置（本地引擎） ----------
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 LLM_MODEL_NAME = os.getenv("LLM_MODEL", "qwen2.5:7b")
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "bge-m3")
+
+# ---------- 云端大模型配置（可选 · 联网引擎；OpenAI 兼容接口） ----------
+# 支持任意 OpenAI 兼容服务：DeepSeek（默认）/ 通义 / Kimi / 硅基流动 / OpenAI 等。
+# 网页端右上角「模型设置」可按用户切换 本地 ⇄ 云端；此处是系统默认与共享密钥。
+# CLOUD_API_KEY 留空时，仍允许用户在网页端填写「个人 Key」（按用户隔离保存）。
+CLOUD_BASE_URL = os.getenv("CLOUD_BASE_URL", "https://api.deepseek.com/v1")
+CLOUD_API_KEY = os.getenv("CLOUD_API_KEY", "")
+CLOUD_MODEL_NAME = os.getenv("CLOUD_MODEL", "deepseek-chat")
+CLOUD_TIMEOUT = int(os.getenv("CLOUD_TIMEOUT", "600"))  # 单次云端请求最长 10 分钟
+
+# 默认模型引擎：local（本地 Ollama，离线）/ cloud（云端 API）
+# 网页端登录用户可在「模型设置」中覆盖；命令行直接使用本默认值。
+LLM_DEFAULT_PROVIDER = os.getenv("LLM_PROVIDER", "local").strip().lower()
 
 # ---------- 向量库与文档配置 ----------
 CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_db")

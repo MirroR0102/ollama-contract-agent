@@ -2,8 +2,8 @@
 """
 app.py —— Contract AI 网页版后端（FastAPI + SSE 流式 + 用户系统）
 将本地化合同审查系统的全部能力封装为 HTTP 接口：
-  知识库问答 / Agent 对话 / 合同审查 / 要素抽取 / 合同入库 / 用户注册登录
-全程本地 Ollama 推理，零云依赖。
+  知识库问答 / Agent 对话 / 合同审查 / 要素抽取 / 合同入库 / 用户注册登录 / 模型设置
+推理引擎双模：本地 Ollama（默认，离线）⇄ 云端 OpenAI 兼容 API（用户可在页面切换）。
 
 用户体系：注册/登录后发放 token（Authorization: Bearer <token>，
 SSE 的 GET 订阅可用 ?token= 参数）。每个用户的合同库（MySQL/SQLite 归属 +
@@ -38,9 +38,11 @@ from agent.jobs import (JobAbort, _friendly_error, create_job, get_job,
                         keepalive_all)
 from agent.kb_agent import need_clarify as kb_clarify, verify_evidence as kb_verify
 from agent.report_agent import summarize as report_summarize
-from core.config import LLM_MODEL_NAME, MAX_CONTEXT_CHARS
-from core.ollama_conn import (BASE_DELAY, MAX_RETRY, is_conn_error,
-                              reset_llm, retry_emb_call)
+from core.config import LLM_DEFAULT_PROVIDER, LLM_MODEL_NAME, MAX_CONTEXT_CHARS
+from core.llm_provider import (BASE_DELAY, MAX_RETRY, PROVIDER_CLOUD,
+                               cloud_status, configure as configure_provider,
+                               is_conn_error, reset_llm)
+from core.ollama_conn import retry_emb_call
 from store.storage import get_store
 from store.vector_store import (add_documents, add_file_to_kb, count_vectors,
                                 db_stats, delete_contract_vectors, get_retriever)
@@ -60,6 +62,50 @@ bootstrap.init_system()
 MODEL_LOCK = threading.Lock()
 
 _BUSY_MSG = "系统正忙：正在执行合同审查等后台推理任务，请稍候再试。"
+
+
+def _apply_user_provider(user) -> str:
+    """把登录用户的模型引擎偏好注入本线程上下文（每个请求/后台任务开头调用）。
+
+    背景：SSE worker / 后台任务都是新建线程，不会继承请求线程的上下文，
+    必须显式调用本函数；后台任务用 _apply_job_provider（按归属用户取偏好）。
+    """
+    u = user or {}
+    return configure_provider(u.get("llm_provider"),
+                              u.get("cloud_api_key"),
+                              u.get("cloud_model"))
+
+
+def _apply_job_provider(job) -> None:
+    """后台任务：按任务归属用户名读取用户偏好并注入本线程上下文。"""
+    try:
+        _apply_user_provider(get_store().get_user_by_name(job.owner))
+    except Exception as e:  # noqa: BLE001
+        print(f"[provider] 注入用户模型偏好失败（按系统默认执行）：{e}")
+
+
+def _model_display(user) -> str:
+    """当前用户的生效模型展示名（如 qwen2.5:7b（本地） / deepseek-chat（云端））。"""
+    provider = ((user or {}).get("llm_provider") or "").strip() or LLM_DEFAULT_PROVIDER
+    if provider == PROVIDER_CLOUD:
+        st = cloud_status((user or {}).get("cloud_api_key"),
+                          (user or {}).get("cloud_model"))
+        return f"{st['model']}（云端）"
+    return f"{LLM_MODEL_NAME}（本地）"
+
+
+def _model_status(user) -> dict:
+    """模型设置页数据：当前引擎 + 本地/云端可用状态（不含密钥明文）。"""
+    provider = ((user or {}).get("llm_provider") or "").strip() or LLM_DEFAULT_PROVIDER
+    if provider not in ("local", "cloud"):
+        provider = "local"
+    return {
+        "provider": provider,
+        "system_default": LLM_DEFAULT_PROVIDER,
+        "local": {"model": LLM_MODEL_NAME},
+        "cloud": cloud_status((user or {}).get("cloud_api_key"),
+                              (user or {}).get("cloud_model")),
+    }
 
 
 def _try_lock() -> bool:
@@ -254,6 +300,39 @@ def api_me(user: dict = Depends(current_user)):
     return {"username": user["username"], "display_name": user.get("display_name") or user["username"]}
 
 
+# ==================== 模型引擎设置（本地 ⇄ 云端，按用户保存） ====================
+class ModelSettingBody(BaseModel):
+    provider: str = None      # "local" / "cloud"；None=不改
+    api_key: str = None       # None=不改；""=清除个人 Key（改用 .env 共享密钥）
+    model: str = None         # None=不改；""=清除个人模型名（用 .env 默认）
+
+
+@app.get("/api/settings/model")
+def api_model_get(user: dict = Depends(current_user)):
+    """查询当前模型引擎设置（不返回密钥明文，仅返回是否已配置/来源）。"""
+    return _model_status(user)
+
+
+@app.post("/api/settings/model")
+def api_model_set(body: ModelSettingBody, user: dict = Depends(current_user)):
+    """切换 本地/云端 引擎，或保存个人云端 Key/模型名（按用户隔离保存）。"""
+    provider = (body.provider or "").strip()
+    if provider and provider not in ("local", "cloud"):
+        raise HTTPException(status_code=400, detail="provider 只能是 local 或 cloud")
+    key = body.api_key.strip() if isinstance(body.api_key, str) else None
+    model = body.model.strip() if isinstance(body.model, str) else None
+    if key is not None and len(key) > 500:
+        raise HTTPException(status_code=400, detail="API Key 过长")
+    if model is not None and len(model) > 120:
+        raise HTTPException(status_code=400, detail="模型名过长")
+    get_store().update_user_llm(
+        user["id"],
+        llm_provider=provider or None,
+        cloud_api_key=key, cloud_model=model)
+    fresh = get_store().get_user_by_id(user["id"]) or user
+    return {"ok": True, **_model_status(fresh)}
+
+
 # ==================== 数据接口 ====================
 @app.get("/api/files")
 def api_files(user: dict = Depends(current_user)):
@@ -278,7 +357,7 @@ def api_files(user: dict = Depends(current_user)):
     return {
         "username": user["username"],
         "files": files,
-        "model": LLM_MODEL_NAME,
+        "model": _model_display(user),
         "stats": db_stats(owner=user["username"]),
         "folders": store.list_folders(user["id"]),
     }
@@ -304,6 +383,7 @@ def api_kb_clarify(body: ClarifyBody, user: dict = Depends(current_user)):
     if not _try_lock():
         raise HTTPException(status_code=429, detail=_BUSY_MSG)
     try:
+        _apply_user_provider(user)
         store = get_store()
         rows = store.list_contracts(user["id"]) or []
         names = [r.get("store_name") or r.get("name") for r in rows]
@@ -322,6 +402,7 @@ def api_kb_query(body: KBQueryBody, user: dict = Depends(current_user)):
     Ollama 断连自动重建自愈。事件：stage / evidence(带相关性) / token / message。"""
 
     def worker(send, stop):
+        _apply_user_provider(user)
         if not _try_lock():
             send("error", {"message": _BUSY_MSG})
             return
@@ -734,6 +815,7 @@ def api_chat(body: ChatBody, user: dict = Depends(current_user)):
         )
 
     def worker(send, stop):
+        _apply_user_provider(user)
         if not _try_lock():
             send("error", {"message": _BUSY_MSG})
             return
@@ -888,6 +970,7 @@ def api_draft(body: DraftBody, user: dict = Depends(current_user)):
     可选 reference：读库内某份合同全文作为起草蓝本。"""
 
     def worker(send, stop):
+        _apply_user_provider(user)
         if not _try_lock():
             send("error", {"message": _BUSY_MSG})
             return
@@ -1014,6 +1097,7 @@ def _select_dims(names: list) -> list:
 
 def run_review_job(job):
     """合同风险审查任务体（限定在任务归属用户的合同库内；可按 job.payload.dims 只审指定维度）。"""
+    _apply_job_provider(job)  # 先注入任务归属用户的模型引擎偏好（本地/云端）
     if not _wait_model_lock(job):
         return
     try:
@@ -1067,6 +1151,7 @@ def run_review_job(job):
 
 def run_extract_job(job):
     """合同要素抽取任务体（限定在任务归属用户的合同库内）。"""
+    _apply_job_provider(job)
     if not _wait_model_lock(job):
         return
     try:
@@ -1168,6 +1253,7 @@ def _ensure_copy_note(note: str) -> str:
 
 def run_ingest_analyze_job(job):
     """文档接入智能体分析任务：识别类型 → 解析/OCR/解压 → 产出合同候选。"""
+    _apply_job_provider(job)
     path = _stage_file(job.owner, job.filename)
     if not path:
         job.status = "error"
@@ -1287,6 +1373,7 @@ class SummaryBody(BaseModel):
 
 def run_report_summary_job(job):
     """报告解读智能体任务（后台运行，切页不打断）：对 8 维结果流式归纳总结。"""
+    _apply_job_provider(job)
     if not _wait_model_lock(job):
         return
     try:
@@ -1351,6 +1438,7 @@ _INSPECT_FIELDS = ["合同类型", "甲方", "乙方", "合同金额", "履行�
 
 def run_inspect_job(job):
     """合同巡检任务：批量抽取该用户全部合同的要素，汇成可比对的表格行。"""
+    _apply_job_provider(job)
     store = get_store()
     u = store.get_user_by_name(job.owner)
     if not u:
@@ -1739,7 +1827,10 @@ if __name__ == "__main__":
 
     print("=" * 60)
     print("  Contract AI · 本地化智能合同审查系统（网页版 · 用户版）")
-    print(f"  模型：{LLM_MODEL_NAME}   服务：http://localhost:8000")
+    _c = cloud_status()
+    print(f"  本地模型：{LLM_MODEL_NAME} ｜ 云端模型：{_c['model']}"
+          f"{'（已配置）' if _c['ready'] else '（未配置 Key，可在网页端设置）'}")
+    print("  服务：http://localhost:8000（右上角「模型设置」可切换 本地/云端）")
     print(f"  预置演示账号：demo / demo123（含保密协议等演示合同）")
     print("  Ctrl+C 退出")
     print("=" * 60)

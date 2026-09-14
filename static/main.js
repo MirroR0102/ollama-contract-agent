@@ -60,6 +60,7 @@ async function initUserBar() {
   right.innerHTML = '<span class="user-name"></span>' +
     '<button type="button" class="btn btn-ghost btn-sm" id="logoutBtn">退出</button>';
   nav.appendChild(right);
+  initModelPicker(right);   // 模型引擎切换（本地 ⇄ 云端，全站可用）
   const logoutBtn = right.querySelector('#logoutBtn');
   logoutBtn.addEventListener('click', async () => {
     try { await apiFetch('/api/auth/logout', { method: 'POST' }); } catch (e) { /* ignore */ }
@@ -295,4 +296,159 @@ function mountCtxPicker(cfg) {
   // 初始化后主动同步一次：让页面在「刷新/重开」后立即恢复上次勾选（如处理对象提示条）
   if (cfg.onChange) cfg.onChange(selected.slice());
   return { get: () => selected.slice() };
+}
+
+/* ==================== 模型引擎切换（本地 Ollama ⇄ 云端 API） ==================== */
+let MODEL_ST = null;   // /api/settings/model 的最近状态缓存
+let mmEl = null;       // 云端设置弹窗 DOM（懒创建）
+
+/** 轻提示（底部浮条） */
+let _toastTimer = null;
+function toast(msg, ok = true) {
+  let el = document.getElementById('toastMsg');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toastMsg';
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.className = 'show' + (ok ? '' : ' warn');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => { el.className = ''; }, 2800);
+}
+
+function loadModelStatus() {
+  return apiJSON('/api/settings/model').then(st => { MODEL_ST = st; return st; });
+}
+
+/** 把状态渲染到顶部选择器上（含模型名与是否已配置） */
+function applyModelStatus(st) {
+  const sel = document.getElementById('modelSelect');
+  if (!st || !sel) return;
+  sel.querySelector('option[value="local"]').textContent = '🏠 本地 · ' + st.local.model;
+  sel.querySelector('option[value="cloud"]').textContent =
+    '☁️ 云端 · ' + st.cloud.model + (st.cloud.ready ? '' : '（未配置）');
+  sel.title = '云端接口：' + st.cloud.base_url + '（切换对后续请求生效）';
+  sel.value = st.provider;
+}
+
+/** 挂载模型切换器到用户栏（所有页面生效） */
+function initModelPicker(userBar) {
+  const wrap = document.createElement('div');
+  wrap.className = 'model-bar';
+  wrap.innerHTML = `
+    <select class="model-select" id="modelSelect" title="选择模型引擎">
+      <option value="local">🏠 本地模型</option>
+      <option value="cloud">☁️ 云端模型</option>
+    </select>
+    <button type="button" class="btn btn-ghost btn-sm" id="modelCfgBtn"
+            title="云端模型设置（API Key / 模型名）">⚙️</button>`;
+  userBar.insertBefore(wrap, userBar.firstChild);
+  const sel = wrap.querySelector('#modelSelect');
+
+  loadModelStatus().then(applyModelStatus).catch(() => { /* 未登录等场景忽略 */ });
+
+  sel.addEventListener('change', async () => {
+    const want = sel.value;
+    try {
+      let st = MODEL_ST || await loadModelStatus();
+      if (want === 'cloud' && !st.cloud.ready) {
+        const saved = await openModelModal();   // 未配置 → 弹设置框
+        if (!saved) sel.value = st.provider;    // 取消 → 还原
+        return;
+      }
+      const res = await apiJSON('/api/settings/model', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: want }),
+      });
+      MODEL_ST = res; applyModelStatus(res);
+      toast(want === 'cloud' ? '已切换到云端模型（联网）' : '已切换到本地模型（离线）');
+    } catch (e) {
+      toast('切换失败：' + e.message, false);
+      if (MODEL_ST) sel.value = MODEL_ST.provider;
+    }
+  });
+
+  wrap.querySelector('#modelCfgBtn').addEventListener('click', async () => {
+    try { if (!MODEL_ST) await loadModelStatus(); } catch (e) { /* ignore */ }
+    await openModelModal();
+  });
+}
+
+/** 云端设置弹窗：填写/清除个人 Key、修改模型名、保存并启用云端 */
+function openModelModal() {
+  return new Promise(resolve => {
+    if (!mmEl) {
+      mmEl = document.createElement('div');
+      mmEl.className = 'modal-mask hidden';
+      mmEl.innerHTML = `
+        <div class="modal">
+          <h3>☁️ 云端模型设置</h3>
+          <div class="mm-meta" id="mmMeta"></div>
+          <label>API Key</label>
+          <input type="password" id="mmKey" autocomplete="off">
+          <label>模型名</label>
+          <input type="text" id="mmModel" autocomplete="off">
+          <div class="mm-note">⚠️ 联网模式下，检索到的合同片段会发送至云端服务商，请勿用于敏感数据；
+            个人 Key 仅保存在本机数据库中、按账号隔离；留空则使用服务器 .env 配置的共享 Key。</div>
+          <div class="mm-foot">
+            <button type="button" class="btn btn-ghost btn-sm left" id="mmClear">清除个人 Key</button>
+            <button type="button" class="btn btn-ghost" id="mmCancel">取消</button>
+            <button type="button" class="btn btn-primary" id="mmSave">保存并启用云端</button>
+          </div>
+        </div>`;
+      document.body.appendChild(mmEl);
+      mmEl.querySelector('#mmCancel').addEventListener('click', () => close(false));
+      mmEl.addEventListener('click', e => { if (e.target === mmEl) close(false); });
+      mmEl.querySelector('#mmClear').addEventListener('click', async () => {
+        try {
+          const res = await apiJSON('/api/settings/model', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ api_key: '' }),
+          });
+          MODEL_ST = res; applyModelStatus(res); fill();
+          toast('已清除个人 Key（改用服务器共享 Key）');
+        } catch (e) { toast('清除失败：' + e.message, false); }
+      });
+      mmEl.querySelector('#mmSave').addEventListener('click', async () => {
+        const key = mmEl.querySelector('#mmKey').value.trim();
+        const model = mmEl.querySelector('#mmModel').value.trim();
+        const payload = { provider: 'cloud' };
+        if (key) payload.api_key = key;
+        if (model && (!MODEL_ST || model !== MODEL_ST.cloud.model)) payload.model = model;
+        try {
+          const res = await apiJSON('/api/settings/model', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          MODEL_ST = res; applyModelStatus(res);
+          if (!res.cloud.ready) { toast('尚未配置 Key，云端不可用', false); return; }
+          toast('已启用云端模型：' + res.cloud.model);
+          close(true);
+        } catch (e) { toast('保存失败：' + e.message, false); }
+      });
+    }
+    const fill = () => {
+      const st = MODEL_ST;
+      if (!st) return;
+      const keyEl = mmEl.querySelector('#mmKey');
+      const modelEl = mmEl.querySelector('#mmModel');
+      mmEl.querySelector('#mmMeta').textContent =
+        '接口：' + st.cloud.base_url + ' ｜ 当前模型：' + st.cloud.model +
+        (st.cloud.has_personal_key ? '（已保存个人 Key）'
+          : st.cloud.has_env_key ? '（使用服务器共享 Key）' : '（尚未配置 Key）');
+      keyEl.value = '';
+      keyEl.placeholder = st.cloud.has_personal_key
+        ? '已保存个人 Key：留空保持不变' : 'sk-...（留空则用服务器共享 Key）';
+      modelEl.value = '';
+      modelEl.placeholder = st.cloud.model;
+    };
+    const close = ok => { mmEl.classList.add('hidden'); resolve(ok); };
+    fill();
+    mmEl.classList.remove('hidden');
+    mmEl.querySelector('#mmKey').focus();
+  });
 }

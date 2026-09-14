@@ -16,15 +16,37 @@ import uuid
 
 
 def _friendly_error(msg: str) -> str:
-    """把 Ollama / 推理层常见英文报错映射为可操作的中文提示。"""
+    """把 本地 Ollama / 云端 API / 推理层常见英文报错映射为可操作的中文提示。"""
+    low = (msg or "").lower()
+    # ---- 云端（OpenAI 兼容 API）业务错误 ----
+    if any(k in low for k in ("invalid api key", "invalid_api_key", "incorrect api key",
+                              "authenticationerror", "authentication fails",
+                              "unauthorized", "error code: 401")):
+        return ("云端 API Key 无效或未配置：请点击右上角 ⚙️「模型设置」填写有效的 Key，"
+                "或切换回本地模型后重试。")
+    if any(k in low for k in ("insufficient balance", "insufficient_quota",
+                              "error code: 402", "exceeded quota")):
+        return "云端账户余额/额度不足：请前往对应平台充值，或切换回本地模型后重试。"
+    if any(k in low for k in ("rate limit", "rate_limit", "error code: 429",
+                              "too many requests")):
+        return "云端接口请求过于频繁（限流）：请稍等 1-2 分钟重试，或切换回本地模型。"
+    if "model_not_found" in low or "error code: 404" in low:
+        return "云端模型名不存在：请检查「模型设置」中的模型名（如 deepseek-chat）是否正确。"
+    # ---- 本地 Ollama / 推理层 ----
     if "Failed to connect to Ollama" in msg or "connect to Ollama" in msg:
         return ("无法连接本地 Ollama 服务：Ollama 可能正在重启或已退出。"
                 "请确认 Ollama 已启动后重试；若仍报错，请重启网页服务（python app.py）。")
     if "llama-server process has terminated" in msg or "CUDA error" in msg:
         return ("本地模型推理进程异常退出（CUDA / 显存相关）。"
                 "请重启 Ollama 后重试；若频繁出现，建议更新显卡驱动或减小模型上下文。")
-    if "out of memory" in msg.lower() or "allocate" in msg.lower():
+    if "out of memory" in low or "allocate" in low:
         return "显存不足，无法完成推理。请关闭其他占用显存的程序后重试，或减小模型上下文长度。"
+    # ---- 通用连接类（本地/云端都可能出现） ----
+    if any(k in low for k in ("connection error", "apiconnectionerror", "timed out",
+                              "connect timeout", "connection refused", "connection reset",
+                              "proxy", "winerror", "积极拒绝", "无法连接", "连接被")):
+        return ("无法连接模型服务：本地模式请确认 Ollama 已启动；"
+                "云端模式请检查网络/代理是否正常。稍后重试即可。")
     return msg
 
 

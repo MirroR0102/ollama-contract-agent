@@ -12,7 +12,7 @@ from agent.contract_analyzer import (_list_contract_files, analyze_contract,
 from agent.contract_kb import show_rag_demo
 from agent.element_extractor import extract_elements, print_elements
 from core.config import CONTRACTS_DIR, LLM_MODEL_NAME, EMBED_MODEL_NAME
-from core.ollama_conn import get_llm
+from core.llm_provider import get_llm
 from store.vector_store import add_dir_to_kb, add_file_to_kb, clear_db, db_stats
 
 BANNER = f"""
@@ -55,14 +55,14 @@ def _pick_contract(prompt: str) -> str:
 
 def main() -> None:
     print(BANNER)
-    # 启动自检：验证本地模型连通
-    print("⏳ 正在连接本地 Ollama 服务 ...")
+    # 启动自检：验证模型引擎连通（默认本地 Ollama；可在 .env 设 LLM_PROVIDER=cloud 用云端）
+    print("⏳ 正在连接大模型服务 ...")
     try:
         get_llm().invoke("你好")
         print("✅ 大模型连接正常\n")
     except Exception as e:  # noqa: BLE001
         print(f"⚠️  大模型连接失败：{e}")
-        print("   请确认 Ollama 已启动，并已拉取模型（见 README）")
+        print("   本地模式请确认 Ollama 已启动并拉取模型；云端模式请检查 .env 的 CLOUD_ 配置（见 README）")
         return
 
     while True:

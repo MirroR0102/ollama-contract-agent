@@ -6,6 +6,8 @@ langchain-community
 langchain-text-splitters
 langchain-ollama
 langchain-chroma
+# ---- 云端大模型（可选；仅使用本地 Ollama 时可不装） ----
+langchain-openai
 langgraph
 chromadb
 pypdf

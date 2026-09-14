@@ -7,7 +7,8 @@ storage.py —— 用户系统 / 合同库 / 文件夹分组 的统一存储层�
   * MysqlStore ：DB_ENGINE=mysql（需在 .env 配置 DB_HOST/DB_USER/DB_PASSWORD/DB_NAME）
 
 表结构（两后端一致）：
-  users           用户（id/username/password_hash/display_name/created_at）
+  users           用户（id/username/password_hash/display_name/created_at
+                   + llm_provider/cloud_api_key/cloud_model —— 模型引擎偏好）
   sessions        token 会话
   folders         合同库文件夹（id/user_id/name/created_at，user+name 唯一）
   contract_files  合同记录（id/user_id/name[显示标题,可重名]/store_name[磁盘唯一名]
@@ -18,6 +19,8 @@ storage.py —— 用户系统 / 合同库 / 文件夹分组 的统一存储层�
 v2 迁移：自动补列（note/store_name/folder_id）、建 folders、为既有用户建默认
 文件夹“我的合同”并把旧合同回填进去、放开「标题唯一」约束（旧库为 user+name
 唯一，改为 user+store_name 唯一）。
+v3 迁移：users 表补 llm_provider / cloud_api_key / cloud_model 三列
+（模型引擎偏好：本地 Ollama ⇄ 云端 API，可由用户在网页端自由切换）。
 """
 import os
 import sqlite3
@@ -34,7 +37,7 @@ _store_lock = threading.Lock()
 
 DEFAULT_FOLDER_NAME = "我的合同"
 _SCHEMA_VERSION_KEY = "schema_version"
-_SCHEMA_VERSION = "2"
+_SCHEMA_VERSION = "3"
 
 
 def _now() -> str:
@@ -63,6 +66,17 @@ class Store:
 
     def list_users(self):
         """枚举全部用户（维护 / 管理用）。"""
+        raise NotImplementedError
+
+    # ---------- 用户偏好（模型引擎：本地 Ollama / 云端 API） ----------
+    def update_user_llm(self, user_id, *, llm_provider=None,
+                        cloud_api_key=None, cloud_model=None) -> bool:
+        """更新用户的模型引擎偏好。None=不修改；传 ''=清空该字段。
+
+        llm_provider : ''（跟随系统默认）/ 'local' / 'cloud'
+        cloud_api_key: 用户在网页端填写的个人云端密钥（''=清除，改用 .env 共享密钥）
+        cloud_model  : 个人云端模型名覆盖（''=清除，用 .env 的 CLOUD_MODEL）
+        """
         raise NotImplementedError
 
     # ---------- 会话 ----------
@@ -159,6 +173,9 @@ CREATE TABLE IF NOT EXISTS users (
   username TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
   display_name TEXT,
+  llm_provider TEXT DEFAULT '',
+  cloud_api_key TEXT DEFAULT '',
+  cloud_model TEXT DEFAULT '',
   created_at TEXT
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -258,6 +275,17 @@ class SqliteStore(Store):
                 self._conn.execute(
                     "ALTER TABLE contract_files_v2 RENAME TO contract_files")
             self._conn.commit()
+            # v3：users 表补「模型引擎偏好」列（本地/云端切换 + 个人密钥，幂等补列）
+            ucols = _sqlite_columns(self._conn, "users")
+            for _col, _ddl in (
+                ("llm_provider", "TEXT DEFAULT ''"),
+                ("cloud_api_key", "TEXT DEFAULT ''"),
+                ("cloud_model", "TEXT DEFAULT ''"),
+            ):
+                if _col not in ucols:
+                    self._conn.execute(
+                        f"ALTER TABLE users ADD COLUMN {_col} {_ddl}")
+            self._conn.commit()
             # 每个用户默认文件夹 + 回填 NULL folder_id
             self._ensure_all_default_folders()
             self.set_meta(_SCHEMA_VERSION_KEY, _SCHEMA_VERSION)
@@ -306,6 +334,24 @@ class SqliteStore(Store):
         with self._lock:
             cur = self._conn.execute("SELECT id,username FROM users ORDER BY id")
             return [dict(r) for r in cur.fetchall()]
+
+    def update_user_llm(self, user_id, *, llm_provider=None,
+                        cloud_api_key=None, cloud_model=None):
+        sets, args = [], []
+        if llm_provider is not None:
+            sets.append("llm_provider=?"); args.append(llm_provider)
+        if cloud_api_key is not None:
+            sets.append("cloud_api_key=?"); args.append(cloud_api_key)
+        if cloud_model is not None:
+            sets.append("cloud_model=?"); args.append(cloud_model)
+        if not sets:
+            return False
+        args.append(user_id)
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE users SET {', '.join(sets)} WHERE id=?", args)
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def create_session(self, token, user_id):
         with self._lock:
@@ -499,6 +545,9 @@ CREATE TABLE IF NOT EXISTS users (
   username VARCHAR(64) NOT NULL UNIQUE,
   password_hash VARCHAR(255) NOT NULL,
   display_name VARCHAR(64),
+  llm_provider VARCHAR(16) DEFAULT '',
+  cloud_api_key VARCHAR(255) DEFAULT '',
+  cloud_model VARCHAR(128) DEFAULT '',
   created_at VARCHAR(32)
 ) DEFAULT CHARSET=utf8mb4;
 CREATE TABLE IF NOT EXISTS sessions (
@@ -644,6 +693,18 @@ class MysqlStore(Store):
                     cur.execute(
                         "CREATE UNIQUE INDEX uk_user_store "
                         "ON contract_files(user_id, store_name)")
+                # v3：users 表补「模型引擎偏好」列（本地/云端切换 + 个人密钥，幂等补列）
+                cur.execute("SHOW COLUMNS FROM users")
+                ucols = {r["Field"] for r in cur.fetchall()}
+                if "llm_provider" not in ucols:
+                    cur.execute("ALTER TABLE users ADD COLUMN "
+                                "llm_provider VARCHAR(16) DEFAULT ''")
+                if "cloud_api_key" not in ucols:
+                    cur.execute("ALTER TABLE users ADD COLUMN "
+                                "cloud_api_key VARCHAR(255) DEFAULT ''")
+                if "cloud_model" not in ucols:
+                    cur.execute("ALTER TABLE users ADD COLUMN "
+                                "cloud_model VARCHAR(128) DEFAULT ''")
             conn.commit()
         finally:
             conn.close()
@@ -693,6 +754,23 @@ class MysqlStore(Store):
 
     def list_users(self):
         return self._fetch("SELECT id,username FROM users ORDER BY id")
+
+    def update_user_llm(self, user_id, *, llm_provider=None,
+                        cloud_api_key=None, cloud_model=None):
+        sets, args = [], []
+        if llm_provider is not None:
+            sets.append("llm_provider=%s"); args.append(llm_provider)
+        if cloud_api_key is not None:
+            sets.append("cloud_api_key=%s"); args.append(cloud_api_key)
+        if cloud_model is not None:
+            sets.append("cloud_model=%s"); args.append(cloud_model)
+        if not sets:
+            return False
+        args.append(user_id)
+        conn, n = self._q(
+            f"UPDATE users SET {', '.join(sets)} WHERE id=%s", args)
+        conn.close()
+        return n > 0
 
     def create_session(self, token, user_id):
         self._q("REPLACE INTO sessions(token,user_id,created_at) VALUES(%s,%s,%s)",

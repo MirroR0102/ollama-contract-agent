@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 contract_kb.py —— 合同知识库 RAG 问答
-本地 LLM（ChatOllama）严格依据向量库检索到的合同片段作答，
-禁止编造幻觉，并返回引用片段供核对。
+本地/云端 LLM（引擎由 core.llm_provider 统一选择）严格依据向量库检索到的
+合同片段作答，禁止编造幻觉，并返回引用片段供核对。
 """
 import time
 
 from langchain_core.messages import HumanMessage
 
-from core.ollama_conn import (BASE_DELAY, MAX_RETRY, get_llm, is_conn_error,
-                              reset_llm, retry_emb_call)
+from core.llm_provider import (BASE_DELAY, MAX_RETRY, get_llm, is_conn_error,
+                               reset_llm)
+from core.ollama_conn import retry_emb_call
 from store.vector_store import get_retriever
 
 # 无幻觉提示词模板（答辩重点：对比“直接问模型” vs “RAG 问答”）
@@ -42,10 +43,10 @@ def stream_generate(prompt: str, echo: bool = True, emit=None) -> str:
     - emit：可选回调 emit(text片段)，供 Web 端逐 token 转发（SSE）
     返回完整文本。
 
-    自愈说明：Ollama 中途重启导致连接失效时，请求在首个 token 前就会抛连接
-    错误（此时尚未 emit 任何内容），本函数自动重建连接实例并从头重试；若在
-    生成中途断连（Ollama 运行中崩溃），重试会重新输出全文——已 emit 的预览
-    无法回滚，但最终以返回值（完整文本）为准，不影响结果正确性。
+    自愈说明：本地 Ollama 重启 / 云端网络瞬断导致连接失效时，请求在首个 token
+    前就会抛连接错误（此时尚未 emit 任何内容），本函数自动重建对应引擎的客户端
+    实例并从头重试；若在生成中途断连，重试会重新输出全文——已 emit 的预览无法
+    回滚，但最终以返回值（完整文本）为准，不影响结果正确性。
     """
     for attempt in range(MAX_RETRY + 1):
         collected: list[str] = []
