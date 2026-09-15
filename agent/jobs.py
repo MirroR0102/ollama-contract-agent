@@ -246,6 +246,12 @@ def get_job(job_id: str):
         return _jobs.get(job_id)
 
 
+def running_jobs() -> list:
+    """当前仍在 running 的后台任务（供前台提示「模型被谁占用」）。"""
+    with _jobs_lock:
+        return [j for j in _jobs.values() if j.status == "running"]
+
+
 def keepalive_all():
     """用户发起了任意 API 请求 → 说明浏览器仍在使用 → 给后台任务续期。"""
     now = time.time()

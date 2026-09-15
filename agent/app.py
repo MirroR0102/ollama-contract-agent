@@ -35,13 +35,13 @@ from agent.draft_export import export as draft_export
 from agent.element_extractor import extract_elements
 from agent.intake_agent import analyze_file as intake_analyze, make_docs as intake_make_docs
 from agent.jobs import (JobAbort, _friendly_error, create_job, get_job,
-                        keepalive_all)
+                        keepalive_all, running_jobs)
 from agent.kb_agent import need_clarify as kb_clarify, verify_evidence as kb_verify
 from agent.report_agent import summarize as report_summarize
 from core.config import LLM_DEFAULT_PROVIDER, LLM_MODEL_NAME, MAX_CONTEXT_CHARS
 from core.llm_provider import (BASE_DELAY, MAX_RETRY, PROVIDER_CLOUD,
                                cloud_status, configure as configure_provider,
-                               is_conn_error, reset_llm)
+                               get_provider, is_conn_error, reset_llm)
 from core.ollama_conn import retry_emb_call
 from store.storage import get_store
 from store.vector_store import (add_documents, add_file_to_kb, count_vectors,
@@ -58,10 +58,121 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # 启动初始化（幂等）：预置演示账号 demo + 演示合同归户入库
 bootstrap.init_system()
 
-# Ollama 单模型串行：全局锁避免并发推理错乱
-MODEL_LOCK = threading.Lock()
+# 本地 Ollama 同一时刻只能跑一路生成（7B + 长上下文几乎吃满显存）。
+# 云端 API 不占本地显存，不走这把锁。
+# 前台（问答/对话/起草）优先：后台任务在「一个生成单元」结束后让出，
+# 必要时在流式生成中途中断当前单元、让前台先用，后台稍后重跑该单元。
+class _YieldForInteractive(Exception):
+    """后台生成被前台请求打断：当前单元未完成，稍后重试。"""
 
-_BUSY_MSG = "系统正忙：正在执行合同审查等后台推理任务，请稍候再试。"
+
+class _ModelGate:
+    """本地模型互斥门：interactive 优先于 job。"""
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._busy = False
+        self._interactive_waiters = 0
+
+    def interactive_waiting(self) -> bool:
+        with self._cv:
+            return self._interactive_waiters > 0
+
+    def acquire_interactive(self, timeout: float = 180.0) -> bool:
+        deadline = time.time() + timeout
+        with self._cv:
+            self._interactive_waiters += 1
+            self._cv.notify_all()
+            got = False
+            try:
+                while self._busy:
+                    remain = deadline - time.time()
+                    if remain <= 0:
+                        return False
+                    self._cv.wait(timeout=remain)
+                self._busy = True
+                got = True
+                return True
+            finally:
+                self._interactive_waiters -= 1
+                if not got:
+                    self._cv.notify_all()
+
+    def acquire(self, timeout: float = -1):
+        """兼容 threading.Lock.acquire（入库 zip 分组等短调用）。"""
+        deadline = None if timeout is None or timeout < 0 else time.time() + timeout
+        with self._cv:
+            while self._busy or self._interactive_waiters > 0:
+                if deadline is not None:
+                    remain = deadline - time.time()
+                    if remain <= 0:
+                        return False
+                    self._cv.wait(timeout=remain)
+                else:
+                    self._cv.wait(timeout=1.0)
+            self._busy = True
+            return True
+
+    def acquire_job(self, job, slice_s: float = 1.0) -> bool:
+        while True:
+            if job.should_stop():
+                return False
+            with self._cv:
+                if not self._busy and self._interactive_waiters == 0:
+                    self._busy = True
+                    return True
+                self._cv.wait(timeout=slice_s)
+
+    def release(self):
+        with self._cv:
+            self._busy = False
+            self._cv.notify_all()
+
+
+MODEL_GATE = _ModelGate()
+MODEL_LOCK = MODEL_GATE  # 兼容 intake_agent 传入的 model_lock.acquire/release
+_tls = threading.local()
+
+_BUSY_MSG = ("本地模型正被后台任务占用：请稍候（审查会在当前维度结束后自动让出），"
+             "或把右上角引擎切到「云端」后再操作。")
+
+
+def _local_engine() -> bool:
+    return get_provider() != PROVIDER_CLOUD
+
+
+def _lock_hint() -> str:
+    jobs = running_jobs()
+    if not jobs:
+        return _BUSY_MSG
+    j = jobs[0]
+    kind = {"review": "合同审查", "extract": "要素抽取", "inspect": "合同巡检",
+            "report_summary": "报告解读", "ingest_analyze": "文档分析"}.get(j.kind, j.kind)
+    extra = f"第 {j.index}/{j.total} 维「{j.dim_name}」" if j.kind == "review" and j.dim_name else ""
+    return (f"本地模型正被后台「{kind}」占用"
+            + (f"（{extra}）" if extra else "")
+            + "，当前单元结束后会自动让给你。也可切到云端引擎立即使用。")
+
+
+def _try_lock() -> bool:
+    """前台请求抢本地模型：云端引擎无需锁；拿不到则等后台让出（最长 3 分钟）。"""
+    if not _local_engine():
+        _tls.held = False
+        return True
+    ok = MODEL_GATE.acquire_interactive(timeout=180.0)
+    _tls.held = bool(ok)
+    return ok
+
+
+def _unlock():
+    if getattr(_tls, "held", False):
+        MODEL_GATE.release()
+        _tls.held = False
+
+
+def _job_should_yield() -> bool:
+    """后台流式生成中：若有前台在等本地模型，打断当前单元。"""
+    return _local_engine() and MODEL_GATE.interactive_waiting()
 
 
 def _apply_user_provider(user) -> str:
@@ -106,11 +217,6 @@ def _model_status(user) -> dict:
         "cloud": cloud_status((user or {}).get("cloud_api_key"),
                               (user or {}).get("cloud_model")),
     }
-
-
-def _try_lock() -> bool:
-    """即时请求尝试获取模型锁（拿不到即提示忙，避免无限排队假死）。"""
-    return MODEL_LOCK.acquire(timeout=3.0)
 
 
 # ==================== 鉴权 ====================
@@ -380,10 +486,10 @@ def api_kb_clarify(body: ClarifyBody, user: dict = Depends(current_user)):
     """追问澄清智能体：判断问题是否模糊/歧义、需要先反问澄清一轮。
     返回 {"need": bool, "question": str, "cands": [合同名...]}；
     need=false 时前端直接走检索问答；cands 供前端做“点选合同”的澄清交互。"""
+    _apply_user_provider(user)
     if not _try_lock():
-        raise HTTPException(status_code=429, detail=_BUSY_MSG)
+        raise HTTPException(status_code=429, detail=_lock_hint())
     try:
-        _apply_user_provider(user)
         store = get_store()
         rows = store.list_contracts(user["id"]) or []
         names = [r.get("store_name") or r.get("name") for r in rows]
@@ -393,7 +499,7 @@ def api_kb_clarify(body: ClarifyBody, user: dict = Depends(current_user)):
         res["cands"] = names
         return res
     finally:
-        MODEL_LOCK.release()
+        _unlock()
 
 
 @app.post("/api/kb/query")
@@ -403,8 +509,10 @@ def api_kb_query(body: KBQueryBody, user: dict = Depends(current_user)):
 
     def worker(send, stop):
         _apply_user_provider(user)
+        if running_jobs() and _local_engine():
+            send("stage", {"text": "⏳ 后台任务占用本地模型，将在当前生成结束后让出…"})
         if not _try_lock():
-            send("error", {"message": _BUSY_MSG})
+            send("error", {"message": _lock_hint()})
             return
         try:
             send("stage", {"text": "🔍 智能体正在检索合同知识库…"})
@@ -456,7 +564,7 @@ def api_kb_query(body: KBQueryBody, user: dict = Depends(current_user)):
         except Exception as e:  # noqa: BLE001
             send("error", {"message": _friendly_error(str(e))})
         finally:
-            MODEL_LOCK.release()
+            _unlock()
 
     return sse_response(worker)
 
@@ -816,8 +924,10 @@ def api_chat(body: ChatBody, user: dict = Depends(current_user)):
 
     def worker(send, stop):
         _apply_user_provider(user)
+        if running_jobs() and _local_engine():
+            send("stage", {"text": "⏳ 后台任务占用本地模型，将在当前生成结束后让出…"})
         if not _try_lock():
-            send("error", {"message": _BUSY_MSG})
+            send("error", {"message": _lock_hint()})
             return
         try:
             session_context.set_owner(body.thread_id, user["username"])
@@ -953,7 +1063,7 @@ def api_chat(body: ChatBody, user: dict = Depends(current_user)):
         except Exception as e:  # noqa: BLE001
             send("error", {"message": _friendly_error(str(e))})
         finally:
-            MODEL_LOCK.release()
+            _unlock()
 
     return sse_response(worker)
 
@@ -971,8 +1081,10 @@ def api_draft(body: DraftBody, user: dict = Depends(current_user)):
 
     def worker(send, stop):
         _apply_user_provider(user)
+        if running_jobs() and _local_engine():
+            send("stage", {"text": "⏳ 后台任务占用本地模型，将在当前生成结束后让出…"})
         if not _try_lock():
-            send("error", {"message": _BUSY_MSG})
+            send("error", {"message": _lock_hint()})
             return
         try:
             requirement = (body.requirement or "").strip()
@@ -1008,7 +1120,7 @@ def api_draft(body: DraftBody, user: dict = Depends(current_user)):
         except Exception as e:  # noqa: BLE001
             send("error", {"message": _friendly_error(str(e))})
         finally:
-            MODEL_LOCK.release()
+            _unlock()
 
     return sse_response(worker)
 
@@ -1078,12 +1190,13 @@ class FileBody(BaseModel):
 
 # ==================== 后台任务（Job）：跨页面不中断 ====================
 def _wait_model_lock(job):
-    """后台任务等待模型锁：等待期间若任务应停止则退出返回 False。"""
-    while True:
-        if MODEL_LOCK.acquire(timeout=1.0):
-            return True
-        if job.should_stop():
-            return False
+    """后台任务获取本地模型：有前台在等时让路；云端引擎无需锁。"""
+    if not _local_engine():
+        _tls.held = False
+        return not job.should_stop()
+    ok = MODEL_GATE.acquire_job(job)
+    _tls.held = bool(ok)
+    return ok
 
 
 def _select_dims(names: list) -> list:
@@ -1096,83 +1209,96 @@ def _select_dims(names: list) -> list:
 
 
 def run_review_job(job):
-    """合同风险审查任务体（限定在任务归属用户的合同库内；可按 job.payload.dims 只审指定维度）。"""
+    """合同风险审查任务体（限定在任务归属用户的合同库内；可按 job.payload.dims 只审指定维度）。
+    每个维度单独占用本地模型：前台请求可插入；中途被打断的维度不写入结果、稍后重跑。"""
     _apply_job_provider(job)  # 先注入任务归属用户的模型引擎偏好（本地/云端）
-    if not _wait_model_lock(job):
+    path = bootstrap.resolve_user_file(job.owner, job.filename)
+    if not path:
+        job.status = "error"
+        job.error = f"未找到合同文件：{job.filename}"
         return
     try:
-        path = bootstrap.resolve_user_file(job.owner, job.filename)
-        if not path:
-            job.status = "error"
-            job.error = f"未找到合同文件：{job.filename}"
-            return
-        try:
-            # 确保已入库（幂等）；部分格式（图片/zip 文本）无原生 load，跳过即可
-            add_file_to_kb(path, owner=job.owner,
-                           contract_id=_contract_id_for(job.owner, path))
-        except Exception as e:  # noqa: BLE001
-            print(f"[review] 补充入库跳过（不影响检索）：{e}")
-        # 预检：该合同的向量库必须存在且非空（避免“查无可查”的静默失败）
-        try:
-            n_vec = count_vectors(owner=job.owner,
-                                  source=os.path.basename(path))
-        except Exception as e:  # noqa: BLE001
-            job.status = "error"
-            job.error = f"合同库读取失败（向量库可能已损坏）：{e}"
-            return
-        if n_vec <= 0:
-            job.status = "error"
-            job.error = ("该合同的向量库不存在或为空（可能已损坏或尚未入库）："
-                         "请到「合同入库」页重新导入该合同后再审查。")
-            return
-        cfg = job.payload or {}
-        dims = _select_dims(cfg.get("dims") or [])
-        job.total = len(dims)
-        done_n = len(job.results)  # 断点续跑：跳过已完成的维度
-        for i, dim in enumerate(dims, 1):
-            if i <= done_n:
-                continue
-            if job.should_stop():
-                return
-            job.index, job.dim_name, job.text = i, dim["name"], ""
-
-            def emit(t, _j=job):
-                _j.text += t
-                if _j.should_stop():
-                    raise JobAbort()
-
-            result = analyze_dimension(
-                os.path.basename(path), dim, stream=False, emit=emit, owner=job.owner,
-            )
-            job.results.append(result)
-    finally:
-        MODEL_LOCK.release()
-
-
-def run_extract_job(job):
-    """合同要素抽取任务体（限定在任务归属用户的合同库内）。"""
-    _apply_job_provider(job)
-    if not _wait_model_lock(job):
-        return
+        # 确保已入库（幂等）；部分格式（图片/zip 文本）无原生 load，跳过即可
+        add_file_to_kb(path, owner=job.owner,
+                       contract_id=_contract_id_for(job.owner, path))
+    except Exception as e:  # noqa: BLE001
+        print(f"[review] 补充入库跳过（不影响检索）：{e}")
+    # 预检：该合同的向量库必须存在且非空（避免“查无可查”的静默失败）
     try:
-        path = bootstrap.resolve_user_file(job.owner, job.filename)
-        if not path:
-            job.status = "error"
-            job.error = f"未找到合同文件：{job.filename}"
+        n_vec = count_vectors(owner=job.owner,
+                              source=os.path.basename(path))
+    except Exception as e:  # noqa: BLE001
+        job.status = "error"
+        job.error = f"合同库读取失败（向量库可能已损坏）：{e}"
+        return
+    if n_vec <= 0:
+        job.status = "error"
+        job.error = ("该合同的向量库不存在或为空（可能已损坏或尚未入库）："
+                     "请到「合同入库」页重新导入该合同后再审查。")
+        return
+    cfg = job.payload or {}
+    dims = _select_dims(cfg.get("dims") or [])
+    job.total = len(dims)
+    i = len(job.results)  # 断点续跑 / 让出后重跑：已完成的维度不再审
+    while i < len(dims):
+        if job.should_stop():
             return
-        job.text = ""
-        job.dim_name = "关键要素抽取"
-        job.total = 1
-        job.index = 1
+        dim = dims[i]
+        if not _wait_model_lock(job):
+            return
+        job.index, job.dim_name, job.text = i + 1, dim["name"], ""
 
         def emit(t, _j=job):
             _j.text += t
             if _j.should_stop():
                 raise JobAbort()
+            if _job_should_yield():
+                raise _YieldForInteractive()
 
-        job.payload = extract_elements(path, stream=False, emit=emit)
-    finally:
-        MODEL_LOCK.release()
+        try:
+            result = analyze_dimension(
+                os.path.basename(path), dim, stream=False, emit=emit, owner=job.owner,
+            )
+            job.results.append(result)
+            i += 1
+        except _YieldForInteractive:
+            job.text = ""  # 本维未完成，下一轮重跑
+            job.set_stage("前台任务优先，本维审查稍后继续…")
+        finally:
+            _unlock()
+
+
+def run_extract_job(job):
+    """合同要素抽取任务体（限定在任务归属用户的合同库内）。"""
+    _apply_job_provider(job)
+    path = bootstrap.resolve_user_file(job.owner, job.filename)
+    if not path:
+        job.status = "error"
+        job.error = f"未找到合同文件：{job.filename}"
+        return
+    job.dim_name = "关键要素抽取"
+    job.total = 1
+    job.index = 1
+    while job.payload is None:
+        if job.should_stop():
+            return
+        if not _wait_model_lock(job):
+            return
+        job.text = ""
+
+        def emit(t, _j=job):
+            _j.text += t
+            if _j.should_stop():
+                raise JobAbort()
+            if _job_should_yield():
+                raise _YieldForInteractive()
+
+        try:
+            job.payload = extract_elements(path, stream=False, emit=emit)
+        except _YieldForInteractive:
+            job.text = ""
+        finally:
+            _unlock()
 
 
 # ==================== 入库流程（v2：暂存 → 智能体分析 → 用户确认 → 入库） ====================
@@ -1262,7 +1388,9 @@ def run_ingest_analyze_job(job):
     job.total = 1
     job.index = 0
     job.set_stage("文档接入智能体已启动：正在识别文件类型…")
-    result = intake_analyze(path, emit=job.set_stage, model_lock=MODEL_LOCK)
+    result = intake_analyze(
+        path, emit=job.set_stage,
+        model_lock=None if not _local_engine() else MODEL_GATE)
     job.payload = result
     n = len(result.get("candidates") or [])
     job.set_stage(f"分析完成：识别到 {n} 份合同候选" + ("，请勾选要导入的部分" if n > 1 else ""))
@@ -1374,23 +1502,32 @@ class SummaryBody(BaseModel):
 def run_report_summary_job(job):
     """报告解读智能体任务（后台运行，切页不打断）：对 8 维结果流式归纳总结。"""
     _apply_job_provider(job)
-    if not _wait_model_lock(job):
-        return
-    try:
-        cfg = job.payload or {}
-        results = cfg.get("results") or []
-        filename = cfg.get("filename") or "该合同"
+    cfg = job.payload if isinstance(job.payload, dict) else {}
+    results = cfg.get("results") or []
+    filename = cfg.get("filename") or "该合同"
+    # payload 在完成后会被写成全文 str；未完成时保持 dict
+    while not isinstance(job.payload, str):
+        if job.should_stop():
+            return
+        if not _wait_model_lock(job):
+            return
+        job.text = ""
         job.set_stage("报告解读智能体正在生成总结…")
 
         def emit(t, _j=job):
             _j.text += t
             if _j.should_stop():
                 raise JobAbort()
+            if _job_should_yield():
+                raise _YieldForInteractive()
 
-        full = report_summarize(results, filename, emit=emit)
-        job.payload = full  # 存全文，供刷新/切页回来直接恢复
-    finally:
-        MODEL_LOCK.release()
+        try:
+            full = report_summarize(results, filename, emit=emit)
+            job.payload = full  # 存全文，供刷新/切页回来直接恢复
+        except _YieldForInteractive:
+            job.text = ""
+        finally:
+            _unlock()
 
 
 @app.post("/api/review/summary")
@@ -1450,21 +1587,30 @@ def run_inspect_job(job):
         job.status = "error"
         job.error = "合同库为空，请先到「合同入库」页导入合同后再巡检。"
         return
-    if not _wait_model_lock(job):
-        return
-    try:
-        total = len(rows)
-        job.total = total
-        out_rows: list = []
-        for idx, rec in enumerate(rows, 1):
-            if job.should_stop():
-                return
-            name = rec.get("store_name") or rec.get("name") or ""
-            title = rec.get("name") or name
-            job.index = idx
-            job.dim_name = name
-            job.set_stage(f"[{idx}/{total}] 正在抽取《{title}》的关键要素…")
-            data: dict = {}
+    total = len(rows)
+    job.total = total
+    out_rows: list = list((job.payload or {}).get("rows") or []) if isinstance(job.payload, dict) else []
+    idx = len(out_rows)
+    while idx < total:
+        if job.should_stop():
+            return
+        rec = rows[idx]
+        name = rec.get("store_name") or rec.get("name") or ""
+        title = rec.get("name") or name
+        job.index = idx + 1
+        job.dim_name = name
+        if not _wait_model_lock(job):
+            return
+        job.set_stage(f"[{idx + 1}/{total}] 正在抽取《{title}》的关键要素…")
+        data: dict = {}
+        yielded = False
+        try:
+            def emit(t, _j=job):
+                if _j.should_stop():
+                    raise JobAbort()
+                if _job_should_yield():
+                    raise _YieldForInteractive()
+
             path = bootstrap.resolve_user_file(job.owner, name)
             if path:
                 try:
@@ -1473,22 +1619,27 @@ def run_inspect_job(job):
                     if len(txt) > MAX_CONTEXT_CHARS:
                         txt = txt[:MAX_CONTEXT_CHARS]
                     if txt.strip():
-                        data = extract_elements(name, stream=False, text=txt)
-                except Exception as e:  # noqa: BLE001
+                        data = extract_elements(name, stream=False, text=txt, emit=emit)
+                except _YieldForInteractive:
+                    yielded = True
+                except Exception:  # noqa: BLE001
                     data = {}
-            row = {"file": name, "title": title,
-                   "folder": rec.get("folder_name") or ""}
-            if isinstance(data, dict):
-                for k in _INSPECT_FIELDS:
-                    row[k] = str(data.get(k) or "").strip()
-            if not isinstance(data, dict) or not any(row.get(k) for k in _INSPECT_FIELDS):
-                row["合同类型"] = "(抽取失败)"
-            out_rows.append(row)
-            job.payload = {"rows": list(out_rows)}  # 增量保存，中断也可查看部分结果
-        job.set_stage(f"巡检完成：共抽取 {len(out_rows)} 份合同")
-        job.payload = {"rows": out_rows}
-    finally:
-        MODEL_LOCK.release()
+        finally:
+            _unlock()
+        if yielded:
+            continue
+        row = {"file": name, "title": title,
+               "folder": rec.get("folder_name") or ""}
+        if isinstance(data, dict):
+            for k in _INSPECT_FIELDS:
+                row[k] = str(data.get(k) or "").strip()
+        if not isinstance(data, dict) or not any(row.get(k) for k in _INSPECT_FIELDS):
+            row["合同类型"] = "(抽取失败)"
+        out_rows.append(row)
+        job.payload = {"rows": list(out_rows)}  # 增量保存，中断也可查看部分结果
+        idx += 1
+    job.set_stage(f"巡检完成：共抽取 {len(out_rows)} 份合同")
+    job.payload = {"rows": out_rows}
 
 
 @app.post("/api/inspect/run")
