@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-vector_store.py —— Chroma 本地向量库管理
+vector_store.py —— Chroma 本地向量库
+
+讲 RAG 时，入库看 add_documents，检索看 get_retriever，删合同看
+delete_contract_vectors。嵌入对象不要在模块顶上抓一次就一直用：
+get_db() 每次通过 get_embedding() 绑定「当前」实例，Ollama 重启后
+retry_emb_call 才能换成新连接。
+
 提供：入库（按 owner+contract_id 域去重）、检索器、统计、删除、清库。
 
 隔离模型（v2）：每个用户的每份合同拥有独立向量域。切片 metadata 含

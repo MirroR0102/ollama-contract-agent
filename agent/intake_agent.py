@@ -25,7 +25,12 @@ MAX_CANDIDATE_CHARS = 60000
 
 # ---------------- 文本 → 分块文档 ----------------
 def make_docs(source_name: str, text: str):
-    """把整篇文本按合同语义切成 LangChain Document 列表（source=磁盘名）。"""
+    """把整篇文本切成 LangChain Document 列表。
+
+    分块器是 store/document_loader.text_splitter，和 txt/pdf 命令行入库同一套
+    分隔符与块大小。source_name 应传磁盘唯一名 store_name，后面检索靠它过滤。
+    这里不写 owner / contract_id，那两个字段在 vector_store.add_documents 里补。
+    """
     from langchain_core.documents import Document
     from store.document_loader import text_splitter
     parts = text_splitter.split_text(text or "")

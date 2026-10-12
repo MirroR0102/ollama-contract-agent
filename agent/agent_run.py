@@ -1,10 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-agent_run.py —— 带记忆的合同审查 Agent（LangGraph 实现）
-- 使用 LangChain 1.0 标准 create_agent 构建工具型智能体
-- MemorySaver 实现多轮对话短期上下文记忆（thread_id 隔离不同会话）
-- Agent 自主判断何时调用工具（知识库检索 / 合同审查 / 要素抽取 / 文件清单）
-- 推理引擎双模：默认本地 Ollama（断网可用），可在网页端切换为云端 API
+agent_run.py —— 带记忆的合同审查 Agent（LangGraph / create_agent）
+
+命令行多轮对话的实现在本文件；网页对话复用 build_agent，但流式协议写在
+agent/app.py 的 api_chat，不要在 chat_stream 里找 SSE。
+
+阅读顺序：
+  1. _SYSTEM_PROMPT：四条铁律。核心是「先真实调用工具，再用文字回答」。
+     工具名必须和 agent/tools.py 里的函数名一致。
+  2. build_agent：create_agent(model, tools=ALL_TOOLS, checkpointer=memory)。
+     MemorySaver 是进程内短期记忆，按 config.configurable.thread_id 分会话，
+     服务重启后记忆清空。
+  3. get_agent / reset_agent：命令行用的单例。LLM 连接失效时重建。
+     网页每次 api_chat 会按「当前处理对象」传入另一份 system_prompt，
+     不使用这个单例。
+  4. chat_stream：stream_mode="messages"。
+     tool_call_chunks → 模型决定调哪个工具；
+     AIMessageChunk   → 模型自己的文字；
+     ToolMessage      → 工具返回值（这里只打印前 180 字）。
+
+模型从 core.llm_provider.get_llm() 来：默认本地 Ollama，
+若当前上下文被 configure 成 cloud，则走云端兼容接口。嵌入不在这里。
 """
 from langchain.agents import create_agent
 from langchain_core.messages import (

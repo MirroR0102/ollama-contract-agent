@@ -1,4 +1,21 @@
-/* Contract AI 网页版 公共 JS：SSE 流式解析 + 用户认证 + 通用工具 */
+/*
+ * Contract AI 网页版公共脚本（static/main.js）
+ *
+ * 各 HTML 都引用本文件（含登录页和首页 index.html）。
+ * 业务页通过 initPage 做登录守卫；登录页自己提交注册/登录。
+ * 后端对应 agent/app.py，不要在这里找业务规则。
+ * 智能体对话在 / （index.html），知识库问答在 /kb，两者不要看成同一页。
+ *
+ * 认证：
+ *   token 存在 localStorage 键 ct_token。requireAuth 没有 token 就去 /login。
+ *   apiFetch / streamSSE 都带 Authorization: Bearer。401 会清 token 并跳登录。
+ *
+ * SSE（和 agent/app.py 的 _sse 对齐）：
+ *   服务端每条事件是一行 data: {"type","data"}，事件之间空一行。
+ *   type=done 结束；type=error 走 onError；其余交给页面自己的 onEvent。
+ *   审查/巡检/入库的进度条订的是 GET /api/jobs/{id}/stream（见各页脚本），
+ *   不一定走下面这个 POST 版 streamSSE。
+ */
 
 /* ==================== 用户认证 ==================== */
 const TOKEN_KEY = 'ct_token';

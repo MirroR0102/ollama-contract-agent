@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-main.py —— 系统统一入口（答辩演示菜单）
-把“入库 → 检索问答 → 合同审查 → 要素抽取 → 记忆 Agent”整条链路串成菜单，
-按数字键即可完成全流程演示。
-运行：python main.py
+main.py —— 命令行演示菜单（python main.py）
+
+五步和网页不是同一条入口：这里直接调 vector_store / contract_kb /
+contract_analyzer / element_extractor / agent_run.interactive。
+不登录、不写 session_context，所以工具里的 owner 为空，
+合同文件解析落在 contracts/ 目录，而不是 uploads/<用户名>/。
+
+网页演示请用项目根的 app.py。本菜单适合离线把一条链路跑通。
 """
 import os
 

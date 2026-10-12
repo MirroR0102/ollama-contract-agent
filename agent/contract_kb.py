@@ -1,8 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 contract_kb.py —— 合同知识库 RAG 问答
-本地/云端 LLM（引擎由 core.llm_provider 统一选择）严格依据向量库检索到的
-合同片段作答，禁止编造幻觉，并返回引用片段供核对。
+
+数据流：get_retriever(owner, sources).invoke(问题) → 拼成带来源的上下文
+→ stream_generate。检索结果为空时 kb_query 直接返回「未检索到」，
+不会再调用大模型，避免没有证据还生成一段条款。
+
+stream_generate 是全系统的流式出口：审查、抽取、起草、摘要都调用它。
+echo=True 打在终端；emit(piece) 交给网页 SSE。连接在吐出 token 之前断开，
+会 reset_llm 后整段重试；吐到一半断开则无法撤回已经 emit 的预览。
+
+问答页在此之上还有 agent/kb_agent.py：need_clarify 决定要不要先反问，
+verify_evidence 给片段打 high / medium / drop。那两步不在本文件。
 """
 import time
 

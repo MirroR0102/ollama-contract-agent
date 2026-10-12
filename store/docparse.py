@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-docparse.py —— 多格式文档解析（txt / pdf / docx / 图片OCR / zip 压缩包 → 文本）
+docparse.py —— 多格式文档解析（txt / md / pdf / docx / 图片 / zip → 文本）
 
-统一入口：parse_any(path)
-  * 先按「文件头 magic bytes」探测真实类型（防伪装扩展名）
-  * txt/pdf/docx → 直接抽文本
-  * jpg/jpeg/png → 本地 OCR（RapidOCR，离线、中文友好）
-  * zip → 安全解压到临时目录，逐文件递归解析，汇总为候选文本列表
+网页入库的第一站。命令行 load_document 不经过这里。
 
-每个结果带 warnings，前端据此提示用户（如图片 OCR 可能有误）。
+统一思路：先 sniff_kind（扩展名 + 文件头），再选读取函数。
+  txt/md   先按 utf-8 读，失败再按 gb18030
+  pdf      PyPDF
+  docx     python-docx，含表格单元格
+  图片     RapidOCR（本地 onnx，不上传）。扩展名含 jpg/png/bmp/webp
+  zip      解压到临时目录后逐个递归；跳过路径穿越
+
+docx 本身是 zip，所以看到 PK 头时：扩展名是 .docx 就当 Word，否则当压缩包。
+bmp 认 BM 头，webp 认 RIFF....WEBP。
 """
 import os
 import tempfile

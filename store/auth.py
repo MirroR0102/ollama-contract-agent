@@ -1,8 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-auth.py —— 用户认证工具
-  * 密码：PBKDF2-HMAC-SHA256（标准库实现，不存明文、无第三方依赖）
-  * 会话：登录发放随机 token（存 storage.sessions 表），请求带 Authorization 头
+auth.py —— 用户认证（密码哈希 + token 会话）
+
+密码不存明文。hash_password 用标准库 hashlib.pbkdf2_hmac：
+  算法 SHA-256，盐 16 字节随机数，迭代 _PBKDF2_ITER（20 万）次。
+  落库格式是「盐的 hex $ 派生密钥的 hex」，例如 a1b2...$9f3c...。
+  校验时用同一盐重算，再用 hmac.compare_digest 比较，避免逐字符提前返回。
+
+会话不走 cookie 框架。login 成功后 secrets.token_hex(24) 得到 48 位 hex，
+写入 storage.sessions，和 user_id 绑定。agent/app.py 的 current_user
+每次请求调用 user_by_token。logout 删的是这一行 session，不改密码。
+
+本模块不管合同归属。用户名和密码校验通过后，合同隔离看 storage 与
+向量库的 owner。注册本身不创建 uploads 目录，那个在实际上传 / bootstrap 时做。
 """
 import hashlib
 import hmac

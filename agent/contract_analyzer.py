@@ -1,11 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-contract_analyzer.py —— 合同智能审查引擎（核心亮点功能）
-原理：对一份合同，按 8 个常见风险维度逐项“定向检索原文 + 大模型分析”，
-每个维度先定位到合同中最相关的条款片段（降低幻觉），再输出
-{风险等级 / 原文依据 / 审查意见}，最后按风险高低汇总成审查报告。
+contract_analyzer.py —— 合同 8 维审查引擎
 
-全程本地 Ollama 推理，可用于答辩演示“AI 辅助法务审查”。
+不把整篇合同一次塞给模型。每个维度：用该维的 query 去向量库检索
+最多 _DIM_TOP_K（4）段，且 where 同时限制 source（文件名）和 owner（用户），
+再让模型只根据这几段输出 JSON。
+
+阅读顺序：
+  1. core/config.py 的 REVIEW_DIMENSIONS：维度名、检索问句、空白时的风险文案。
+  2. analyze_dimension：单维检索 → stream_generate → _parse_json_response
+     → 若看起来像「未约定」，再用 _has_dim_hits 做规则复核。
+  3. _parse_json_response 三层，专门对付 7B 的残缺 JSON：
+     第一层 去掉 ```json 围栏，按括号配平截出对象，json.loads；
+     第二层 失败则用正则逐个抠 risk_level / evidence / opinion；
+     第三层 再失败返回固定中文，不把原始输出丢给页面。
+  4. analyze_contract：命令行入口。会先 add_file_to_kb（幂等），
+     再按维度循环。网页审查不走这个函数，而走 app.run_review_job，
+     以便按维让出本地模型锁；单维分析仍调用 analyze_dimension。
+
+立场写在 _DIM_PROMPT 里：默认站在甲方看不利条款。这是提示词约定，
+不是另一套规则引擎。
 """
 import os
 import re
@@ -116,6 +130,7 @@ def _parse_json_response(text: str) -> dict:
         return s[start:end] if end > start else None
 
     t = text.strip()
+    # 第一层：去掉 ```json 围栏，按花括号深度截出最外层对象，再 json.loads。
     fence = re.search(r"```(?:json)?\s*(.*?)```", t, re.S)
     if fence:
         t = fence.group(1).strip()
@@ -127,7 +142,7 @@ def _parse_json_response(text: str) -> dict:
                 return obj
         except Exception:  # noqa: BLE001
             pass
-    # 整段解析失败：逐字段正则提取（去掉转义）
+    # 第二层：整段不是合法 JSON 时，按字段正则抠出三个键。只取每个键第一次出现。
     field_pat = re.compile(r'"(risk_level|evidence|opinion)"\s*:\s*"((?:[^"\\]|\\.)*)"')
     found = {}
     for m in field_pat.finditer(t):
@@ -141,7 +156,7 @@ def _parse_json_response(text: str) -> dict:
             "evidence": found.get("evidence", ""),
             "opinion": found.get("opinion", ""),
         }
-    # 彻底失败：给出友好兜底，绝不外露原始 JSON
+    # 第三层：字段也抠不出来。返回固定中文，调用方仍能渲染成一张审查卡片。
     return {
         "risk_level": "未知",
         "evidence": "模型输出格式异常，未能提取条款原文",

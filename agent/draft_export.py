@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-draft_export.py —— 合同草案导出（txt / docx / pdf）
+draft_export.py —— 把起草得到的纯文本变成可下载文件
 
-把起草智能体输出的纯文本草稿按行还原成可下载文件：
-  - txt ：UTF-8 纯文本
-  - docx：python-docx，标题行（第X条/章等）加粗
-  - pdf ：reportlab + 内置中文字体 STSong-Light（离线可用）
+  txt   UTF-8 字节
+  docx  python-docx；匹配「第 X 条/章」的行加粗（依赖 requirements 里的 python-docx）
+  pdf   reportlab + 内置 CID 字体 STSong-Light，不嵌入本机字体文件
+
+导出接口是 export(text, fmt)，网页路由是 POST /api/draft/export。
+存进合同库是另一条路（api_draft_save），导出本身不写向量库。
 """
 import io
 import re

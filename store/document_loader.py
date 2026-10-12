@@ -1,8 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-document_loader.py —— 合同文档加载与智能分块
-支持 txt / pdf 企业合同文档，按中文合同标点做递归分块，
-返回带来源元数据（source / chunk_index）的切片列表。
+document_loader.py —— txt / pdf 加载，以及全系统共用的条款分块器
+
+load_document / load_directory 只接受 txt 与 pdf，给命令行入库和
+vector_store.add_file_to_kb 用。网页上的 docx、图片、zip 由
+store/docparse.py 抽出纯文本，再经 agent/intake_agent.make_docs
+调用本文件的 text_splitter，所以切分规则仍然只有这一处。
+
+每个切片的 metadata：
+  source       文件名（网页侧应是磁盘唯一名 store_name）
+  chunk_index  在该文件内的序号
+owner、contract_id、hash 不在这里写，入库时由 vector_store 补上。
 """
 import os
 
@@ -11,7 +19,12 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core.config import CHUNK_SIZE, CHUNK_OVERLAP
 
-# 合同专用分块器：先按段落、再按中文句读切分，尽量保住条款完整性
+# 合同专用分块器。RecursiveCharacterTextSplitter 按 separators 从左到右尝试：
+# 先段落、再换行，然后才是「第」「条」和中文句读。目的是尽量在条款边界切开，
+# 而不是在句子中间截断。长度用字符数（len），不用 token。
+# 块大小来自 .env：CHUNK_SIZE 默认 450，CHUNK_OVERLAP 默认 80。
+# 网页入库的 docx / 图片 OCR / zip 文本不走 load_document，
+# 但 agent/intake_agent.make_docs 复用的就是下面这个 text_splitter。
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=CHUNK_SIZE,
     chunk_overlap=CHUNK_OVERLAP,

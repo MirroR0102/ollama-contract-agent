@@ -1,12 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-kb_agent.py —— 知识库问答智能体（轻量模型环节）
+kb_agent.py —— 知识库问答页上的两个轻量判断（都真实调用当前 LLM）
 
-为「知识库问答」页提供两个“轻量智能体”环节（均真实调用本地 LLM）：
-  1. need_clarify     追问澄清智能体：判断用户问题是否过于模糊/歧义，需要先反问澄清一轮。
-  2. verify_evidence  证据校验智能体：对检索到的每条合同片段判定相关性
-                      （high 直接相关 / medium 部分相关可参考 / drop 无关或重复），
-                      回答只依据保留片段，实现 RAG 的第二道防幻觉闸门。
+它们不是 LangGraph Agent，也没有工具。只是两次短提示词 + JSON：
+
+  need_clarify
+    先走 _rule_clarify：范围是「全部合同」、库内至少两份、问题像在问条款、
+    又没点名任何文件名时，必须先反问。不足两份或已经限定了 sources，
+    规则层不强制澄清。之后再问一次模型；模型失败或 JSON 无效则 need=False，
+    直接去检索。
+  verify_evidence
+    对已经检索到的片段打 high / medium / drop。drop 不进入最终回答。
+    模型失败或 JSON 无效时，全部按 high 留下，避免校验挂了就把证据丢光。
+
+真正「检索 + 生成回答」在 agent/contract_kb.py。本文件只决定
+「要不要先问清楚」以及「哪些片段可以留下来」。
 """
 import json
 import re

@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-draft_agent.py —— 合同起草智能体
+draft_agent.py —— 合同起草
 
-根据用户自然语言需求（含标的/金额/期限/违约责任等）流式生成一份结构完整的
-中文合同草案。可选传入“参考蓝本”（库内某份合同全文），按其结构与行文风格起草。
-本地 LLM 生成（Ollama），支持 rewrite 模式换一种结构与措辞重写。
+网页 POST /api/draft 调用 draft()。不检索向量库，也不调用工具：
+把用户需求和可选的参考合同全文拼进提示词，经 contract_kb.stream_generate
+流式吐出正文。mode="rewrite" 只是在提示词末尾多一句「换一种写法」。
+
+导出不在这里。正文生成后，agent/draft_export.py 负责 txt / docx / pdf；
+存回合同库走 app.api_draft_save，之后才能被审查和问答看到。
 """
 from agent.contract_kb import stream_generate
 

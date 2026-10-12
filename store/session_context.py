@@ -1,6 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-session_context.py —— 会话级「上下文合同范围」（网页版用）
+session_context.py —— 会话级「当前用户 + 合同范围」（进程内字典）
+
+这不是数据库，也不是 LangGraph 的 MemorySaver。MemorySaver 记的是对话消息；
+这里记的是工具执行时需要的三个旁路字段，都挂在 thread_id 上：
+  owner     用户名，检索和读文件时做隔离
+  sources   限定的合同文件名列表；None 表示该用户的全部合同
+  question  最近一次用户原话，审查工具用来猜维度
+
+三个 dict 加一把锁。超过 _MAX_THREADS（500）时丢掉最旧的大约 100 条。
+进程重启即丢失，不影响已入库的向量。命令行不调用 set_*，工具侧读到的就是空。
 
 记录每个会话（thread_id）当前选定的上下文合同文件集合：
   - 未记录 / None          → 全部合同（默认，不限制）

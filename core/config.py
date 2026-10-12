@@ -1,8 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-config.py —— 全局统一配置读取
-从 .env 读取 本地 Ollama / 云端大模型（OpenAI 兼容）服务地址与模型名、
-向量库与分块参数，所有模块通过 from config import ... 使用同一份配置。
+config.py —— 全局配置（.env → 常量）
+
+业务代码不要自己 os.getenv。模型名、向量库路径、分块长度、数据库、
+演示账号、审查维度都从这里读。
+
+谁在用哪些常量（讲代码时按这个跳）：
+  OLLAMA_HOST / LLM_MODEL_NAME / EMBED_MODEL_NAME
+      core/ollama_conn.py 构造 ChatOllama 与 OllamaEmbeddings
+  CLOUD_* / LLM_DEFAULT_PROVIDER
+      core/llm_provider.py；网页用户偏好可以覆盖默认引擎
+  CHROMA_PATH / CHUNK_SIZE / CHUNK_OVERLAP
+      store/vector_store.py 、 store/document_loader.py
+  REVIEW_DIMENSIONS
+      agent/contract_analyzer.py 与 agent/tools.py 的维度名校验
+  MAX_CONTEXT_CHARS
+      要素抽取、摘要等「送全文」的路径，超出就截断
+  DB_* / DEMO_*
+      store/storage.py 、 store/bootstrap.py
+
+改模型只改 .env 里的 LLM_MODEL、EMBED_MODEL。嵌入模型一换，旧的
+chroma_db 向量空间就对不上，需要重新入库。
 """
 import os
 import sys

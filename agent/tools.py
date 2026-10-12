@@ -1,11 +1,33 @@
 # -*- coding: utf-8 -*-
 """
-tools.py —— 自定义工具集（供 Agent 自主调用）
-使用 @tool 装饰器把系统能力封装为 LLM 可决策调用的工具：
-  1. search_contract_knowledge  知识库检索问答（RAG Tool）
-  2. analyze_contract           合同多维度智能审查
-  3. extract_contract_elements  合同关键要素结构化抽取
-  4. list_contract_files        查看库内可用合同清单
+tools.py —— Agent 可调用的工具集（LangChain @tool）
+
+这是讲「智能体」时的第一站。模型能调用什么，只看本文件末尾的 ALL_TOOLS；
+agent/agent_run.py 的 build_agent(tools=ALL_TOOLS) 和 agent/app.py 的
+_get_tool_map() 都读这一份，命令行和网页不会各维护一套工具。
+
+阅读顺序：
+  1. ALL_TOOLS：注册表，顺序即下面十个工具。
+  2. 任意一个 @tool：函数名就是模型看到的工具名，docstring 会变成工具说明。
+  3. _thread_ctx：从 RunnableConfig 里的 thread_id 找回
+     store/session_context 登记的 owner 与合同范围。
+     网页在 /api/chat 里先 set_owner / set_sources，工具执行时才读得到。
+     命令行不登记，owner 为空，审查/抽取退回 contracts/ 目录。
+
+十个工具（与 ALL_TOOLS 一致）：
+  search_contract_knowledge        按当前用户、当前合同范围做 RAG 问答
+  analyze_contract_tool            调 contract_analyzer，可按问题猜维度
+  extract_contract_elements_tool   调 element_extractor，抽出固定字段
+  list_contract_files_tool         当前用户合同清单
+  get_kb_stats_tool                向量切片规模
+  get_contract_info_tool           库内一条合同的备注、大小、入库信息
+  list_folders_tool                文件夹分组
+  locate_clause_tool               关键词在原文中的位置（偏确定性扫描）
+  summarize_contract_tool          通读（截断后的）全文再概括
+  compare_contracts_tool           两份合同对照，仍要求依据原文
+
+检索兜底：_keyword_scan_fallback 在向量片段没带上问句关键词时，
+再按行扫全文。数值类问题（租金、违约金）单靠向量容易漏。
 """
 import os
 import re

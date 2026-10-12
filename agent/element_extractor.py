@@ -1,9 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 element_extractor.py —— 合同关键要素结构化抽取
-输入一份合同 → 本地 LLM 抽取 {合同类型、当事人、金额、期限、日期、管辖等}，
-以 JSON 结构化输出，方便后续二次开发（表单回填、报表、比对）。
-是“从非结构化文本到结构化数据”的典型落地场景。
+
+和 contract_analyzer 的差别（讲代码时不要混）：
+  * 审查：按维度检索若干切片，每维一份小 JSON（风险 / 依据 / 意见）。
+  * 抽取：把合同全文（超过 MAX_CONTEXT_CHARS 则截断）一次送给模型，
+    要回 10 个固定字段。巡检 run_inspect_job 与单份抽取、
+    以及工具 extract_contract_elements_tool，都调用 extract_elements。
+
+提示词要求原文没有的字段填 null，不要猜。解析比审查宽松：
+_parse_json 只做「去围栏 → 截取第一个 {...} → json.loads」。
+失败时返回 {解析失败, 原始输出前 300 字}，没有审查那种字段级正则抢救。
 """
 import json
 import os
@@ -57,7 +64,12 @@ def extract_elements(name: str, stream: bool = True, emit=None, text: str = None
 
 
 def _parse_json(text: str) -> dict:
-    """容错解析模型输出的 JSON。"""
+    """从模型输出里取出一个 JSON 对象。
+
+    只做两步清洗：去掉 ```json 围栏，再截最外层花括号。
+    json.loads 失败就原样带回错误信息，调用方可以区分「没抽到」和「格式坏了」。
+    审查结果的三层抢救在 contract_analyzer._parse_json_response，不要假设这里也有。
+    """
     text = text.strip()
     fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
     if fence:

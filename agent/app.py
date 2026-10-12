@@ -1,15 +1,40 @@
 # -*- coding: utf-8 -*-
 """
-app.py —— Contract AI 网页版后端（FastAPI + SSE 流式 + 用户系统）
-将本地化合同审查系统的全部能力封装为 HTTP 接口：
-  知识库问答 / Agent 对话 / 合同审查 / 要素抽取 / 合同入库 / 用户注册登录 / 模型设置
-推理引擎双模：本地 Ollama（默认，离线）⇄ 云端 OpenAI 兼容 API（用户可在页面切换）。
+app.py —— Contract AI 网页版后端（FastAPI + SSE + 用户系统）
 
-用户体系：注册/登录后发放 token（Authorization: Bearer <token>，
-SSE 的 GET 订阅可用 ?token= 参数）。每个用户的合同库（MySQL/SQLite 归属 +
-Chroma owner 隔离）完全独立、互不可见。
+根目录 app.py 只做 uvicorn 启动并导入本模块的 app。业务全在这里。
+启动：python app.py → http://127.0.0.1:8000。模块导入时会调用
+bootstrap.init_system()，幂等创建演示账号并把 contracts/ 样例归到 demo。
 
-启动：python app.py  →  http://localhost:8000
+讲代码时建议按这个顺序跳，不要从头线性读：
+
+  鉴权
+    current_user / _extract_token
+    token 优先 Authorization: Bearer，SSE 的 GET 订阅可以用 ?token=。
+  流式
+    _sse → sse_generator → sse_response
+    worker 在后台线程里 send(type, payload)，主协程从队列取出，
+    写成 data: {...}\\n\\n。客户端断开时置 stop，worker 应停止推理。
+  页面（只返回 static HTML）
+    /  /kb  /review  /ingest  /draft  /inspect  /login
+  账号与模型
+    /api/auth/register|login|logout  /api/me  /api/settings/model
+    每次请求用 _apply_user_provider 把该用户的 local/cloud 写进 contextvars。
+  问答与对话
+    /api/kb/clarify  /api/kb/query     知识库页，带澄清和证据校验
+    /api/chat                          智能体；内部 build_agent，不走 chat_stream
+  长任务（立即返回 job_id，进度走 /api/jobs/{id}/stream）
+    run_review_job / run_extract_job / run_inspect_job
+    run_ingest_analyze_job / run_ingest_commit_job / run_report_summary_job
+    任务体在 agent/jobs.py；本文件只写每种任务具体干什么。
+  本地模型锁
+    _ModelGate：本地 Ollama 同时只跑一路生成，前台可打断后台当前单元。
+    云端 provider 不进这把锁。
+
+多租户有两层，缺一不可：
+  storage 的 contract_files.user_id 决定「这份合同记录属于谁」；
+  Chroma metadata.owner 决定「检索时能不能看到这些切片」。
+越权任务在 _own_job 里直接当不存在。
 """
 import asyncio
 import json
