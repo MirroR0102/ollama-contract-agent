@@ -1,8 +1,17 @@
 # Web 版开发计划（网页化改造）
 
 > 目标：把本地化合同审查系统（Contract AI · Ollama 离线版）封装为**本地网页版**，
-> 复用现有 Python 模块，FastAPI 提供接口 + SSE 流式，前端 4 个页面。
+> 复用现有 Python 模块，FastAPI 提供接口 + SSE 流式。初期按 4 个页面规划，当前页面见下方「现状」。
 > 用途：课程答辩演示 + 求职简历（展示服务化封装 / AI 应用工程师能力）。
+
+## 现状
+
+主入口是工作台 `/workbench`：合同状态列表，以及入库、审查的主路径。登录成功进入这里；`/` 仍是智能体对话页。
+
+合同表 `contract_files` 使用状态字段 `status`，枚举为 `uploaded|ingesting|ready|reviewing|reviewed|archived|failed`，并带 `current_job_id`、`last_error`、`status_updated_at`。
+
+初期「前端 4 个页面」的说法已过时。现有页面：`/login`、`/workbench`、`/kb`、`/`（对话）、`/review`、`/ingest`、`/draft`、`/inspect`。
+用户分 admin、legal、viewer 三个角色；审计与改角色在管理页 /admin，仅管理员可见。
 
 ## 一、整体架构
 
@@ -28,6 +37,8 @@
 │   └── main.js           # SSE 流式读取等公共逻辑
 └── requirements.txt      # + fastapi uvicorn python-multipart
 ```
+
+以上目录是初期四页规划。当前 `static/` 还有 `login.html`、`workbench.html`、`draft.html`、`inspect.html`。
 
 ## 三、接口设计
 | 接口 | 方法 | 功能 | 返回 |

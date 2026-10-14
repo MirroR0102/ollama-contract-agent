@@ -18,6 +18,7 @@ bootstrap.init_system()，幂等创建演示账号并把 contracts/ 样例归到
   页面（只返回 static HTML）
     /  /kb  /review  /ingest  /draft  /inspect  /login
   账号与模型
+    /api/health  /health             无需登录的环境探活（Ollama 挂了也返回 200）
     /api/auth/register|login|logout  /api/me  /api/settings/model
     每次请求用 _apply_user_provider 把该用户的 local/cloud 写进 contextvars。
   问答与对话
@@ -258,7 +259,41 @@ def current_user(request: Request) -> dict:
     user = auth.user_by_token(_extract_token(request))
     if not user:
         raise HTTPException(status_code=401, detail="未登录或登录已过期，请重新登录")
+    user["role"] = (user.get("role") or "legal").strip() or "legal"
     return user
+
+
+def require_write(user: dict = Depends(current_user)) -> dict:
+    """legal 与 admin 可写。viewer 只能查看。"""
+    if user.get("role") == "viewer":
+        raise HTTPException(status_code=403, detail="当前是只读角色，不能执行此操作")
+    return user
+
+
+def require_admin(user: dict = Depends(current_user)) -> dict:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="需要管理员权限")
+    return user
+
+
+def _client_ip(request: Request) -> str:
+    if request is not None and request.client:
+        return request.client.host or ""
+    return ""
+
+
+def _audit(request, user, action, target_type="", target_id="", detail=None, username=""):
+    """审计失败不影响主流程。detail 不要放密码或密钥。"""
+    who = user or {}
+    get_store().write_audit(
+        user_id=who.get("id"),
+        username=who.get("username") or username or "",
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        detail=detail,
+        ip=_client_ip(request),
+    )
 
 
 @app.middleware("http")
@@ -273,7 +308,9 @@ async def _no_cache_static(request, call_next):
     """页面与静态资源禁用缓存：改版后刷新即可看到最新版本。"""
     response = await call_next(request)
     path = request.url.path
-    if path.startswith("/static/") or path in ("/", "/kb", "/review", "/ingest", "/draft", "/inspect", "/login"):
+    if path.startswith("/static/") or path in (
+            "/", "/kb", "/review", "/ingest", "/draft", "/inspect", "/login",
+            "/workbench", "/admin"):
         response.headers["Cache-Control"] = "no-cache"
     return response
 
@@ -350,6 +387,34 @@ def _own_job(job_id: str, user: dict):
     return job
 
 
+# ==================== 健康检查（无需登录） ====================
+def _health_payload() -> dict:
+    """探活失败也返回可序列化的 JSON，避免 Ollama 宕机把接口打成 500。"""
+    try:
+        return bootstrap.system_health()
+    except Exception as e:  # noqa: BLE001
+        return {
+            "ok": False,
+            "db": {"ok": False, "engine": "unknown", "detail": f"{type(e).__name__}: {e}"},
+            "ollama": {"ok": False, "host": "", "detail": "健康检查内部错误"},
+            "models": {
+                "llm": "",
+                "embed": "",
+                "llm_present": None,
+                "embed_present": None,
+                "detail": "未完成检查",
+            },
+            "llm_provider": {"provider": "local", "cloud_configured": False},
+            "chroma": {"ok": False, "path": "", "detail": "未完成检查"},
+        }
+
+
+@app.get("/api/health")
+@app.get("/health")
+def api_health():
+    return _health_payload()
+
+
 # ==================== 页面路由 ====================
 @app.get("/")
 def page_index():
@@ -381,9 +446,19 @@ def page_inspect():
     return FileResponse(os.path.join(STATIC_DIR, "inspect.html"))
 
 
+@app.get("/workbench")
+def page_workbench():
+    return FileResponse(os.path.join(STATIC_DIR, "workbench.html"))
+
+
 @app.get("/login")
 def page_login():
     return FileResponse(os.path.join(STATIC_DIR, "login.html"))
+
+
+@app.get("/admin")
+def page_admin():
+    return FileResponse(os.path.join(STATIC_DIR, "admin.html"))
 
 
 # ==================== 认证接口 ====================
@@ -413,10 +488,13 @@ def api_register(body: RegisterBody):
 
 
 @app.post("/api/auth/login")
-def api_login(body: LoginBody):
+def api_login(body: LoginBody, request: Request):
     sess = auth.login(body.username, body.password)
     if not sess:
+        _audit(request, None, "login_fail", "user", body.username,
+               {"username": body.username}, username=body.username)
         raise HTTPException(status_code=401, detail="用户名或密码错误")
+    _audit(request, sess, "login_ok", "user", sess.get("username") or "")
     return {"ok": True, **sess}
 
 
@@ -428,7 +506,11 @@ def api_logout(user: dict = Depends(current_user), request: Request = None):
 
 @app.get("/api/me")
 def api_me(user: dict = Depends(current_user)):
-    return {"username": user["username"], "display_name": user.get("display_name") or user["username"]}
+    return {
+        "username": user["username"],
+        "display_name": user.get("display_name") or user["username"],
+        "role": user.get("role") or "legal",
+    }
 
 
 # ==================== 模型引擎设置（本地 ⇄ 云端，按用户保存） ====================
@@ -445,7 +527,8 @@ def api_model_get(user: dict = Depends(current_user)):
 
 
 @app.post("/api/settings/model")
-def api_model_set(body: ModelSettingBody, user: dict = Depends(current_user)):
+def api_model_set(body: ModelSettingBody, request: Request,
+                  user: dict = Depends(require_admin)):
     """切换 本地/云端 引擎，或保存个人云端 Key/模型名（按用户隔离保存）。"""
     provider = (body.provider or "").strip()
     if provider and provider not in ("local", "cloud"):
@@ -461,30 +544,60 @@ def api_model_set(body: ModelSettingBody, user: dict = Depends(current_user)):
         llm_provider=provider or None,
         cloud_api_key=key, cloud_model=model)
     fresh = get_store().get_user_by_id(user["id"]) or user
+    _audit(request, user, "model_set", "user", user["id"], {
+        "provider": provider or "",
+        "key_updated": key is not None,
+        "model_updated": model is not None,
+    })
     return {"ok": True, **_model_status(fresh)}
 
 
 # ==================== 数据接口 ====================
+def _contract_id_of(user, filename):
+    """按磁盘文件名找当前用户的合同 id；没有则 None。"""
+    if not filename:
+        return None
+    rec = get_store().get_contract_by_store(user["id"], os.path.basename(filename))
+    return rec["id"] if rec else None
+
+
+def _contract_public(f: dict) -> dict:
+    return {
+        "id": f["id"],
+        "name": f.get("store_name") or f["name"],
+        "title": f["name"],
+        "note": f.get("note") or "",
+        "dir": f.get("dir") or "uploads",
+        "size": f.get("size") or 0,
+        "folder_id": f.get("folder_id"),
+        "folder_name": f.get("folder_name") or "",
+        "created_at": f.get("created_at"),
+        "status": f.get("status") or "ready",
+        "current_job_id": f.get("current_job_id") or "",
+        "last_error": f.get("last_error") or "",
+        "status_updated_at": f.get("status_updated_at") or "",
+    }
+
+
+def _with_open_findings(user_id, pubs: list) -> list:
+    counts = get_store().open_finding_counts(user_id)
+    for p in pubs:
+        p["open_findings"] = int(counts.get(int(p["id"]), 0))
+    return pubs
+
+
 @app.get("/api/files")
-def api_files(user: dict = Depends(current_user)):
+def api_files(status: str = "", user: dict = Depends(current_user)):
     """当前用户的合同清单 + 系统状态。
     兼容：每项 name = 磁盘唯一名 store_name（旧前端用它定位/显示），
-    新前端用 title/note/folder 等字段展示。
+    新前端用 title/note/folder 等字段展示。status 可选，用于按生命周期筛选。
     """
+    from store.contract_status import STATUSES
+    if status and status not in STATUSES:
+        raise HTTPException(status_code=400, detail="未知合同状态")
     store = get_store()
-    files = []
-    for f in store.list_contracts(user["id"]):
-        files.append({
-            "id": f["id"],
-            "name": f.get("store_name") or f["name"],     # 兼容字段：磁盘唯一名
-            "title": f["name"],                            # 显示标题（可重名）
-            "note": f.get("note") or "",
-            "dir": f.get("dir") or "uploads",
-            "size": f.get("size") or 0,
-            "folder_id": f.get("folder_id"),
-            "folder_name": f.get("folder_name") or "",
-            "created_at": f.get("created_at"),
-        })
+    files = [_contract_public(f) for f in store.list_contracts(
+        user["id"], status=status or None)]
     return {
         "username": user["username"],
         "files": files,
@@ -1100,7 +1213,7 @@ class DraftBody(BaseModel):
 
 
 @app.post("/api/draft")
-def api_draft(body: DraftBody, user: dict = Depends(current_user)):
+def api_draft(body: DraftBody, user: dict = Depends(require_write)):
     """合同起草智能体：按自然语言需求流式生成中文合同草案。
     可选 reference：读库内某份合同全文作为起草蓝本。"""
 
@@ -1176,7 +1289,7 @@ class DraftSaveBody(BaseModel):
 
 
 @app.post("/api/draft/save")
-def api_draft_save(body: DraftSaveBody, user: dict = Depends(current_user)):
+def api_draft_save(body: DraftSaveBody, user: dict = Depends(require_write)):
     """把 AI 起草的草稿一键存为合同：落盘 uploads/<user>/ + 登记 + 分块向量化。
     入库后即可被知识库问答 / 智能体对话 / 合同审查使用（起草→入库→审查闭环）。"""
     text = (body.text or "").strip()
@@ -1200,6 +1313,8 @@ def api_draft_save(body: DraftSaveBody, user: dict = Depends(current_user)):
         docs = intake_make_docs(store_name, text)
         if docs:
             add_documents(docs, owner=user["username"], contract_id=str(rec["id"]))
+        from store.contract_status import change_contract
+        change_contract(u["id"], rec["id"], "ready")
         return {"ok": True, "store_name": store_name,
                 "contract_id": rec["id"], "chunks": len(docs)}
     except HTTPException:
@@ -1291,6 +1406,29 @@ def run_review_job(job):
             job.set_stage("前台任务优先，本维审查稍后继续…")
         finally:
             _unlock()
+    # 全部维度跑完才覆盖落库。中途暂停、中止或失败不写半套；写入在一个事务里，失败会留下上一轮结果。
+    if i >= len(dims) and job.results and job.status != "error" and not job.should_stop():
+        _persist_review_findings(job)
+
+
+def _persist_review_findings(job):
+    """把本次审查结果整批写入 review_findings。找不到合同则跳过，不让任务崩溃。"""
+    from store.findings import rows_from_results
+    try:
+        store = get_store()
+        user = store.get_user_by_name(job.owner)
+        if not user:
+            print("[review] 找不到任务所属用户，跳过 findings 落库", flush=True)
+            return
+        cid = getattr(job, "contract_id", None) or _contract_id_of(user, job.filename)
+        if not cid:
+            print(f"[review] 未找到合同记录，跳过 findings 落库：{job.filename}", flush=True)
+            return
+        n = store.replace_contract_findings(
+            user["id"], int(cid), job.id, rows_from_results(job.results))
+        print(f"[review] 已写入 findings {n} 条 contract={cid}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[review] findings 落库失败（审查结果仍在本次任务里）：{e}", flush=True)
 
 
 def run_extract_job(job):
@@ -1501,11 +1639,20 @@ def run_ingest_commit_job(job):
         if not rec:
             job.set_stage(f"《{title}》登记失败（可能重名冲突），已跳过")
             continue
+        from store.contract_status import change_contract
+        change_contract(user["id"], rec["id"], "ingesting", job_id=job.id, error="")
         # 分块 + 向量化（该合同独立向量域 contract_id）
         job.set_stage(f"[{i}/{total}] 正在分块向量化《{title}》…")
-        docs = intake_make_docs(store_name, text)
-        if docs:
-            add_documents(docs, owner=job.owner, contract_id=str(rec["id"]))
+        try:
+            docs = intake_make_docs(store_name, text)
+            if docs:
+                add_documents(docs, owner=job.owner, contract_id=str(rec["id"]))
+            change_contract(user["id"], rec["id"], "ready", job_id=None, error="")
+        except Exception as e:  # noqa: BLE001
+            change_contract(user["id"], rec["id"], "failed", job_id=None,
+                            error=f"入库失败：{e}")
+            job.set_stage(f"《{title}》入库失败：{e}")
+            continue
         done += 1
         job.set_stage(f"[{i}/{total}] 《{title}》入库完成（{len(docs)} 个切片）")
 
@@ -1556,7 +1703,7 @@ def run_report_summary_job(job):
 
 
 @app.post("/api/review/summary")
-def api_review_summary(body: SummaryBody, user: dict = Depends(current_user)):
+def api_review_summary(body: SummaryBody, user: dict = Depends(require_write)):
     """提交「报告解读」后台任务：立即返回 job_id（SSE 订阅 /api/jobs/{id}/stream）。
     后台任务不依赖页面存活：切页/刷新都不打断生成。"""
     results = [r for r in (body.results or []) if isinstance(r, dict)]
@@ -1564,19 +1711,23 @@ def api_review_summary(body: SummaryBody, user: dict = Depends(current_user)):
         raise HTTPException(status_code=400, detail="没有可解读的审查结果")
     job = create_job(
         "report_summary", (body.filename or "summary")[:120], run_report_summary_job,
-        owner=user["username"],
+        owner=user["username"], contract_id=_contract_id_of(user, body.filename),
         payload={"filename": body.filename or "该合同", "results": results})
     return {"ok": True, "job_id": job.id}
 
 
 @app.post("/api/analyze")
-def api_analyze(body: FileBody, user: dict = Depends(current_user)):
+def api_analyze(body: FileBody, request: Request, user: dict = Depends(require_write)):
     """提交合同审查任务（可按 dims 只审指定维度）：立即返回 job_id。"""
     if not bootstrap.resolve_user_file(user["username"], body.filename):
         raise HTTPException(status_code=404, detail=f"你的合同库中不存在文件：{body.filename}")
     dims = _select_dims(body.dims or [])
+    cid = _contract_id_of(user, body.filename)
     job = create_job("review", body.filename, run_review_job, owner=user["username"],
+                     contract_id=cid,
                      payload={"dims": [d["name"] for d in dims]})
+    _audit(request, user, "review_start", "contract", cid or "",
+           {"filename": body.filename, "job_id": job.id})
     return {
         "ok": True,
         "job_id": job.id,
@@ -1586,11 +1737,12 @@ def api_analyze(body: FileBody, user: dict = Depends(current_user)):
 
 
 @app.post("/api/extract")
-def api_extract(body: FileBody, user: dict = Depends(current_user)):
+def api_extract(body: FileBody, user: dict = Depends(require_write)):
     """提交合同要素抽取任务：立即返回 job_id。"""
     if not bootstrap.resolve_user_file(user["username"], body.filename):
         raise HTTPException(status_code=404, detail=f"你的合同库中不存在文件：{body.filename}")
-    job = create_job("extract", body.filename, run_extract_job, owner=user["username"])
+    job = create_job("extract", body.filename, run_extract_job, owner=user["username"],
+                     contract_id=_contract_id_of(user, body.filename))
     return {"ok": True, "job_id": job.id, "filename": body.filename}
 
 
@@ -1668,8 +1820,9 @@ def run_inspect_job(job):
 
 
 @app.post("/api/inspect/run")
-def api_inspect_run(user: dict = Depends(current_user)):
+def api_inspect_run(user: dict = Depends(require_write)):
     """提交「合同巡检」后台任务：批量抽取全部合同要素。"""
+    # inspect 覆盖全部合同，不回写某一份合同的 status（见 store/contract_status.py）。
     job = create_job("inspect", "合同巡检", run_inspect_job, owner=user["username"])
     return {"ok": True, "job_id": job.id, "job_kind": "inspect"}
 
@@ -1796,7 +1949,7 @@ class FolderBody(BaseModel):
 
 
 @app.post("/api/folders")
-def api_folder_create(body: FolderBody, user: dict = Depends(current_user)):
+def api_folder_create(body: FolderBody, user: dict = Depends(require_write)):
     """新建合同库文件夹。"""
     name = (body.name or "").strip()
     if not name:
@@ -1810,7 +1963,7 @@ def api_folder_create(body: FolderBody, user: dict = Depends(current_user)):
 
 
 @app.delete("/api/folders/{folder_id}")
-def api_folder_delete(folder_id: int, user: dict = Depends(current_user)):
+def api_folder_delete(folder_id: int, request: Request, user: dict = Depends(require_write)):
     """删除文件夹及其下全部合同（前端需两次确认）。"""
     store = get_store()
     folder = store.get_folder(user["id"], folder_id)
@@ -1820,17 +1973,22 @@ def api_folder_delete(folder_id: int, user: dict = Depends(current_user)):
     for c in contracts:
         _delete_contract_assets(user, c)
     store.delete_folder_row(user["id"], folder_id)
+    _audit(request, user, "folder_delete", "folder", folder_id,
+           {"name": folder.get("name") or "", "deleted_contracts": len(contracts)})
     return {"ok": True, "deleted_contracts": len(contracts)}
 
 
 @app.delete("/api/contracts/{contract_id}")
-def api_contract_delete(contract_id: int, user: dict = Depends(current_user)):
+def api_contract_delete(contract_id: int, request: Request,
+                        user: dict = Depends(require_write)):
     """删除单份合同（含向量切片与文件；前端需两次确认）。"""
     store = get_store()
     contract = store.get_contract(user["id"], contract_id)
     if not contract:
         raise HTTPException(status_code=404, detail="合同不存在或无权访问")
     _delete_contract_assets(user, contract)
+    _audit(request, user, "contract_delete", "contract", contract_id,
+           {"name": contract.get("store_name") or contract.get("name") or ""})
     return {"ok": True}
 
 
@@ -1842,7 +2000,7 @@ class ContractUpdateBody(BaseModel):
 
 @app.patch("/api/contracts/{contract_id}")
 def api_contract_update(contract_id: int, body: ContractUpdateBody,
-                        user: dict = Depends(current_user)):
+                        user: dict = Depends(require_write)):
     """更新合同：改标题 / 备注 / 移动到其它文件夹。"""
     store = get_store()
     contract = store.get_contract(user["id"], contract_id)
@@ -1863,6 +2021,106 @@ def api_contract_update(contract_id: int, body: ContractUpdateBody,
                                note=body.note if body.note is not None else None,
                                folder_id=folder_id)
     return {"ok": bool(ok)}
+
+
+def _finding_public(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "contract_id": row["contract_id"],
+        "dimension": row.get("dimension") or "",
+        "severity": row.get("severity") or "info",
+        "title": row.get("title") or "",
+        "detail": row.get("detail") or "",
+        "quote": row.get("quote") or "",
+        "location": row.get("location") or "",
+        "status": row.get("status") or "open",
+        "note": row.get("note") or "",
+        "job_id": row.get("job_id") or "",
+        "created_at": row.get("created_at") or "",
+        "updated_at": row.get("updated_at") or "",
+    }
+
+
+def _owned_contract(user, contract_id: int):
+    rec = get_store().get_contract(user["id"], contract_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="合同不存在或无权访问")
+    return rec
+
+
+@app.get("/api/contracts/{contract_id}/findings")
+def api_findings(contract_id: int, status: str = "", user: dict = Depends(current_user)):
+    """当前用户某份合同的审查发现。status 可选。"""
+    from store.findings import STATUSES
+    if status and status not in STATUSES:
+        raise HTTPException(status_code=400, detail="未知处理状态")
+    _owned_contract(user, contract_id)
+    rows = get_store().list_findings(user["id"], contract_id, status or None)
+    return {"contract_id": contract_id, "findings": [_finding_public(r) for r in rows]}
+
+
+@app.get("/api/contracts/{contract_id}/findings/summary")
+def api_findings_summary(contract_id: int, user: dict = Depends(current_user)):
+    summary = get_store().findings_summary(user["id"], contract_id)
+    if summary is None:
+        raise HTTPException(status_code=404, detail="合同不存在或无权访问")
+    return summary
+
+
+class FindingPatch(BaseModel):
+    status: str = None
+    note: str = None
+
+
+@app.patch("/api/findings/{finding_id}")
+def api_finding_patch(finding_id: int, body: FindingPatch, request: Request,
+                      user: dict = Depends(require_write)):
+    """更新一条发现的处理状态或备注。只能改自己的。"""
+    if body.status is None and body.note is None:
+        raise HTTPException(status_code=400, detail="没有要更新的内容")
+    old = get_store().get_finding(user["id"], finding_id)
+    try:
+        row = get_store().update_finding(
+            user["id"], finding_id,
+            status=body.status, note=body.note)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not row:
+        raise HTTPException(status_code=404, detail="发现不存在或无权访问")
+    _audit(request, user, "finding_update", "finding", finding_id, {
+        "contract_id": row.get("contract_id"),
+        "status": f"{(old or {}).get('status') or ''}→{row.get('status') or ''}",
+    })
+    return {"ok": True, "finding": _finding_public(row)}
+
+
+@app.post("/api/contracts/{contract_id}/report/export")
+def api_report_export(contract_id: int, request: Request, format: str = "docx",
+                      scope: str = "all", user: dict = Depends(current_user)):
+    """按已落库的 findings 导出 docx 或 pdf。scope=all 或 actionable（未处理+已接受）。"""
+    from urllib.parse import quote
+    from agent.report_export import export_report
+    rec = _owned_contract(user, contract_id)
+    kind = (scope or "all").strip().lower()
+    if kind not in ("all", "actionable"):
+        raise HTTPException(status_code=400, detail="scope 只能是 all 或 actionable")
+    rows = get_store().list_findings(user["id"], contract_id)
+    if kind == "actionable":
+        rows = [r for r in rows if (r.get("status") or "") in ("open", "accepted")]
+    try:
+        data, media, ext = export_report(rec, rows, format)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    filename = quote(f"{(rec.get('name') or '合同')}_审查报告.{ext}")
+    _audit(request, user, "report_export", "contract", contract_id,
+           {"format": ext, "scope": kind, "count": len(rows)})
+    return Response(
+        content=data, media_type=media,
+        headers={
+            "Content-Disposition":
+            f"attachment; filename=\"review_report.{ext}\"; filename*=UTF-8''{filename}",
+        },
+    )
 
 
 # ==================== 入库（v2：多格式 + 接入智能体 + 两段式） ====================
@@ -1886,7 +2144,7 @@ class CommitBody(BaseModel):
 
 @app.post("/api/ingest/stage")
 async def api_ingest_stage(file: UploadFile = File(...),
-                           user: dict = Depends(current_user)):
+                           user: dict = Depends(require_write)):
     """第一步：上传文件到暂存区（不做任何解析/入库）。"""
     name = (file.filename or "contract.txt").replace("\\", "/")
     safe = os.path.basename(name).replace("/", "_")
@@ -1913,7 +2171,7 @@ async def api_ingest_stage(file: UploadFile = File(...),
 
 
 @app.post("/api/ingest/discard")
-def api_ingest_discard(body: StageNameBody, user: dict = Depends(current_user)):
+def api_ingest_discard(body: StageNameBody, user: dict = Depends(require_write)):
     """放弃暂存文件。"""
     p = _stage_file(user["username"], body.stage_name)
     if p:
@@ -1925,18 +2183,19 @@ def api_ingest_discard(body: StageNameBody, user: dict = Depends(current_user)):
 
 
 @app.post("/api/ingest/analyze")
-def api_ingest_analyze(body: StageNameBody, user: dict = Depends(current_user)):
+def api_ingest_analyze(body: StageNameBody, user: dict = Depends(require_write)):
     """第二步：后台「文档接入智能体」分析暂存文件（识别类型/解析/切分）。"""
     p = _stage_file(user["username"], body.stage_name)
     if not p:
         raise HTTPException(status_code=404, detail="暂存文件不存在，请重新上传")
+    # 分析阶段还没有合同行，不改 status；入库提交时按每份合同回写。
     job = create_job("ingest_analyze", body.stage_name, run_ingest_analyze_job,
                      owner=user["username"])
     return {"ok": True, "job_id": job.id}
 
 
 @app.post("/api/ingest/check")
-def api_ingest_check(body: CheckBody, user: dict = Depends(current_user)):
+def api_ingest_check(body: CheckBody, user: dict = Depends(require_write)):
     """同步预检：哪些项存在「同名标题 + 备注完全相同」的既有合同。"""
     store = get_store()
     conflicts = []
@@ -1956,7 +2215,8 @@ def api_ingest_check(body: CheckBody, user: dict = Depends(current_user)):
 
 
 @app.post("/api/ingest/commit")
-def api_ingest_commit(body: CommitBody, user: dict = Depends(current_user)):
+def api_ingest_commit(body: CommitBody, request: Request,
+                      user: dict = Depends(require_write)):
     """第三步：按用户确认的候选清单入库（登记 → 落盘 → 向量化，后台任务）。"""
     store = get_store()
     src = get_job(body.analyze_job_id or "")
@@ -1995,7 +2255,156 @@ def api_ingest_commit(body: CommitBody, user: dict = Depends(current_user)):
                "stage_name": body.stage_name, "items": final_items}
     job = create_job("ingest_commit", body.stage_name, run_ingest_commit_job,
                      owner=user["username"], payload=payload)
+    _audit(request, user, "ingest_commit", "job", job.id, {"count": len(final_items)})
     return {"ok": True, "job_id": job.id, "total": len(final_items)}
+
+
+def _job_brief(job_id, username):
+    if not job_id:
+        return None
+    job = get_job(str(job_id))
+    if not job or (job.owner and job.owner != username):
+        return None
+    return {
+        "id": job.id,
+        "kind": job.kind,
+        "status": job.status,
+        "error": job.error,
+        "filename": job.filename,
+        "contract_id": job.contract_id,
+        "index": job.index,
+        "total": job.total,
+    }
+
+
+def _wb_get(user, contract_id):
+    rec = get_store().get_contract(user["id"], contract_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="合同不存在或无权访问")
+    return rec
+
+
+def _wb_move(user, contract_id, status, **kwargs):
+    from store.contract_status import IllegalTransition
+    _wb_get(user, contract_id)
+    try:
+        ok = get_store().set_contract_status(user["id"], contract_id, status, **kwargs)
+    except IllegalTransition as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not ok:
+        raise HTTPException(status_code=404, detail="合同不存在或无权访问")
+    fresh = get_store().get_contract(user["id"], contract_id)
+    return {"ok": True, "contract": _contract_public(fresh)}
+
+
+@app.get("/api/workbench/contracts")
+def api_wb_contracts(status: str = "", q: str = "", limit: int = 100, offset: int = 0,
+                     user: dict = Depends(current_user)):
+    """当前用户的工作台合同列表。可按状态、标题筛选。"""
+    from store.contract_status import STATUSES
+    if status and status not in STATUSES:
+        raise HTTPException(status_code=400, detail="未知合同状态")
+    limit = max(1, min(int(limit or 100), 200))
+    offset = max(0, int(offset or 0))
+    rows = get_store().list_contracts(
+        user["id"], status=status or None, q=(q or "").strip() or None,
+        limit=limit, offset=offset)
+    pubs = _with_open_findings(user["id"], [_contract_public(r) for r in rows])
+    return {
+        "contracts": pubs,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/api/workbench/contracts/{contract_id}")
+def api_wb_contract(contract_id: int, user: dict = Depends(current_user)):
+    """合同详情、最近任务摘要、当前可执行操作。只返回本人的合同。"""
+    from store.contract_status import actions_for
+    rec = _wb_get(user, contract_id)
+    pub = _with_open_findings(user["id"], [_contract_public(rec)])[0]
+    return {
+        "contract": pub,
+        "job": _job_brief(pub["current_job_id"], user["username"]),
+        "actions": actions_for(pub["status"]),
+    }
+
+
+@app.post("/api/workbench/contracts/{contract_id}/archive")
+def api_wb_archive(contract_id: int, request: Request, user: dict = Depends(require_write)):
+    result = _wb_move(user, contract_id, "archived", touch_job=True, job_id=None)
+    _audit(request, user, "archive", "contract", contract_id, {})
+    return result
+
+
+@app.post("/api/workbench/contracts/{contract_id}/unarchive")
+def api_wb_unarchive(contract_id: int, request: Request, user: dict = Depends(require_write)):
+    """取消归档，回到可审查。不另存归档前的状态。"""
+    result = _wb_move(user, contract_id, "ready",
+                      touch_job=True, job_id=None, touch_error=True, error="")
+    _audit(request, user, "unarchive", "contract", contract_id, {})
+    return result
+
+
+@app.post("/api/workbench/contracts/{contract_id}/retry")
+def api_wb_retry(contract_id: int, user: dict = Depends(require_write)):
+    """失败后回到可重试状态：入库失败回到待入库，其余回到可审查，并清掉错误。"""
+    rec = _wb_get(user, contract_id)
+    err = rec.get("last_error") or ""
+    target = "uploaded" if str(err).startswith("入库") else "ready"
+    return _wb_move(user, contract_id, target,
+                    touch_job=True, job_id=None, touch_error=True, error="")
+
+
+class RoleBody(BaseModel):
+    role: str
+
+
+@app.get("/api/admin/users")
+def api_admin_users(user: dict = Depends(require_admin)):
+    """用户名与角色。不含密码和密钥，也不含他人合同正文。"""
+    return {"users": get_store().list_users()}
+
+
+@app.patch("/api/admin/users/{user_id}")
+def api_admin_set_role(user_id: int, body: RoleBody, request: Request,
+                       user: dict = Depends(require_admin)):
+    """改角色。不能把最后一个 admin 降下去。"""
+    role = (body.role or "").strip()
+    if role not in ("admin", "legal", "viewer"):
+        raise HTTPException(status_code=400, detail="角色只能是 admin、legal 或 viewer")
+    store = get_store()
+    target = store.get_user_by_id(user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    old = target.get("role") or "legal"
+    if old == "admin" and role != "admin" and store.count_role("admin") <= 1:
+        raise HTTPException(status_code=400, detail="不能取消最后一个管理员")
+    try:
+        store.set_user_role(user_id, role)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    _audit(request, user, "role_change", "user", user_id, {
+        "username": target.get("username") or "",
+        "old": old,
+        "new": role,
+    })
+    fresh = store.get_user_by_id(user_id)
+    return {"ok": True, "user": {
+        "id": fresh["id"],
+        "username": fresh.get("username"),
+        "role": fresh.get("role"),
+    }}
+
+
+@app.get("/api/admin/audit")
+def api_admin_audit(action: str = "", limit: int = 100, offset: int = 0,
+                    user: dict = Depends(require_admin)):
+    """最近审计。可按 action 筛选。"""
+    limit = max(1, min(int(limit or 100), 200))
+    offset = max(0, int(offset or 0))
+    rows = get_store().list_audit(action=(action or "").strip(), limit=limit, offset=offset)
+    return {"logs": rows, "limit": limit, "offset": offset}
 
 
 if __name__ == "__main__":

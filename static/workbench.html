@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>工作台 · Contract AI</title>
+<link rel="stylesheet" href="/static/style.css?v=8">
+</head>
+<body>
+  <header class="navbar">
+    <div class="brand"><span class="logo">⚖️</span> Contract AI</div>
+    <nav>
+      <a href="/workbench" data-page="workbench">🗂️ 工作台</a>
+      <a href="/kb" data-page="kb">📚 知识库问答</a>
+      <a href="/" data-page="chat">🤖 智能体对话</a>
+      <a href="/draft" data-page="draft">📝 AI 起草</a>
+      <a href="/review" data-page="review">📋 合同审查</a>
+      <a href="/inspect" data-page="inspect">📊 合同巡检</a>
+      <a href="/ingest" data-page="ingest">📤 合同入库</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    <div class="card">
+      <div class="page-title">🗂️ 合同工作台</div>
+      <div class="page-sub">按状态查看自己的合同，继续入库、审查或归档。进行中的任务会留在这里。</div>
+      <div class="wb-toolbar">
+        <div class="wb-tabs" id="wbTabs"></div>
+        <input id="wbQ" class="wb-search" type="search" placeholder="按合同名称搜索">
+      </div>
+      <div id="wbList"></div>
+      <div id="wbDetail" class="wb-detail"></div>
+    </div>
+  </main>
+
+<script src="/static/main.js?v=8"></script>
+<script>
+const STATUS = [
+  ['', '全部'],
+  ['uploaded', '待入库'],
+  ['ingesting', '入库中'],
+  ['ready', '可审查'],
+  ['reviewing', '审查中'],
+  ['reviewed', '已审查'],
+  ['failed', '失败'],
+  ['archived', '已归档'],
+];
+const LABEL = Object.fromEntries(STATUS.filter(x => x[0]));
+let curStatus = '';
+let selected = null;
+let pollTimer = null;
+
+function statusTag(s) {
+  const key = s || 'ready';
+  return '<span class="st st-' + esc(key) + '">' + esc(LABEL[key] || key) + '</span>';
+}
+
+function renderTabs() {
+  document.getElementById('wbTabs').innerHTML = STATUS.map(([k, name]) =>
+    '<button type="button" class="wb-tab' + (k === curStatus ? ' active' : '') +
+    '" data-st="' + esc(k) + '">' + esc(name) + '</button>').join('');
+  document.querySelectorAll('.wb-tab').forEach(btn => {
+    btn.addEventListener('click', () => {
+      curStatus = btn.dataset.st || '';
+      selected = null;
+      renderTabs();
+      loadList();
+    });
+  });
+}
+
+async function loadList() {
+  const q = document.getElementById('wbQ').value.trim();
+  const box = document.getElementById('wbList');
+  const params = new URLSearchParams();
+  if (curStatus) params.set('status', curStatus);
+  if (q) params.set('q', q);
+  try {
+    const data = await apiJSON('/api/workbench/contracts?' + params.toString());
+    const rows = data.contracts || [];
+    if (!rows.length) {
+      const tip = document.body.dataset.role === 'viewer'
+        ? '还没有符合条件的合同。'
+        : '还没有符合条件的合同。<a href="/ingest">去上传第一份合同</a>';
+      box.innerHTML = '<div class="wb-empty">' + tip + '</div>';
+      document.getElementById('wbDetail').innerHTML = '';
+      return;
+    }
+    box.innerHTML = '<table class="wb-table"><thead><tr><th>名称</th><th>状态</th><th>更新时间</th></tr></thead><tbody>' +
+      rows.map(c => '<tr data-id="' + c.id + '"' + (selected === c.id ? ' class="active"' : '') + '>' +
+        '<td>' + esc(c.title || c.name) +
+          (c.open_findings ? '<div class="wb-open">未处理风险 ' + c.open_findings + '</div>' : '') +
+          (c.status === 'failed' && c.last_error ? '<div class="wb-err">' + esc(c.last_error) + '</div>' : '') +
+        '</td><td>' + statusTag(c.status) + '</td><td>' + esc(c.status_updated_at || c.created_at || '') + '</td></tr>'
+      ).join('') + '</tbody></table>';
+    box.querySelectorAll('tr[data-id]').forEach(tr => {
+      tr.addEventListener('click', () => openDetail(Number(tr.dataset.id)));
+    });
+  } catch (e) {
+    box.innerHTML = '<div class="wb-empty">' + esc(e.message) + '</div>';
+  }
+}
+
+function actionButtons(c, actions) {
+  const file = encodeURIComponent(c.name || '');
+  const viewer = document.body.dataset.role === 'viewer';
+  const bits = [];
+  if (!viewer && actions.includes('ingest')) bits.push('<a class="btn btn-primary btn-sm" href="/ingest" data-write>去入库</a>');
+  if (actions.includes('review')) bits.push('<a class="btn btn-primary btn-sm" href="/review?file=' + file + '&contract_id=' + encodeURIComponent(c.id) + '">去审查</a>');
+  if (actions.includes('chat')) bits.push('<a class="btn btn-ghost btn-sm" href="/">看对话</a>');
+  if (actions.includes('kb')) bits.push('<a class="btn btn-ghost btn-sm" href="/kb">知识库</a>');
+  if (!viewer && actions.includes('archive')) bits.push('<button type="button" class="btn btn-ghost btn-sm" id="wbArchive" data-write>归档</button>');
+  if (!viewer && actions.includes('unarchive')) bits.push('<button type="button" class="btn btn-ghost btn-sm" id="wbUnarchive" data-write>取消归档</button>');
+  if (!viewer && actions.includes('retry')) bits.push('<button type="button" class="btn btn-ghost btn-sm" id="wbRetry" data-write>重试</button>');
+  return bits.join('');
+}
+
+async function openDetail(id) {
+  selected = id;
+  clearInterval(pollTimer);
+  const box = document.getElementById('wbDetail');
+  try {
+    const data = await apiJSON('/api/workbench/contracts/' + id);
+    const c = data.contract;
+    const actions = data.actions || [];
+    let jobHtml = '';
+    if (c.current_job_id && (c.status === 'ingesting' || c.status === 'reviewing')) {
+      const job = data.job;
+      const prog = job && job.total ? (' ' + job.index + '/' + job.total) : '';
+      jobHtml = '<div class="wb-job" id="wbJob">任务进行中' + esc(prog) +
+        '（' + esc(c.current_job_id) + '）</div>';
+    }
+    box.innerHTML =
+      '<div class="page-title" style="font-size:16px;">' + esc(c.title || c.name) + '</div>' +
+      '<div class="page-sub">' + statusTag(c.status) +
+      ' · 更新于' + esc(c.status_updated_at || c.created_at || '') + '</div>' +
+      (c.open_findings ? '<div class="wb-open">未处理风险 ' + c.open_findings + ' 条</div>' : '') +
+      (c.last_error ? '<div class="wb-err">' + esc(c.last_error) + '</div>' : '') +
+      jobHtml +
+      '<div class="wb-actions">' + actionButtons(c, actions) + '</div>';
+    const arch = document.getElementById('wbArchive');
+    const un = document.getElementById('wbUnarchive');
+    const retry = document.getElementById('wbRetry');
+    if (arch) arch.addEventListener('click', () => postAction(id, 'archive'));
+    if (un) un.addEventListener('click', () => postAction(id, 'unarchive'));
+    if (retry) retry.addEventListener('click', () => postAction(id, 'retry'));
+    document.querySelectorAll('#wbList tr').forEach(tr => {
+      tr.classList.toggle('active', Number(tr.dataset.id) === id);
+    });
+    if (c.current_job_id && (c.status === 'ingesting' || c.status === 'reviewing')) {
+      pollTimer = setInterval(() => pollJob(id, c.current_job_id), 3000);
+    }
+  } catch (e) {
+    box.innerHTML = '<div class="wb-err">' + esc(e.message) + '</div>';
+  }
+}
+
+async function pollJob(contractId, jobId) {
+  try {
+    const st = await apiJSON('/api/jobs/' + jobId + '/status');
+    const el = document.getElementById('wbJob');
+    if (!st.exists) {
+      if (el) el.textContent = '任务已结束';
+      clearInterval(pollTimer);
+      loadList();
+      openDetail(contractId);
+      return;
+    }
+    if (el) {
+      const prog = st.total ? (' ' + (st.index || 0) + '/' + st.total) : '';
+      el.textContent = '任务进行中' + prog + ' · ' + (st.status || '');
+    }
+    if (st.status && st.status !== 'running' && st.status !== 'paused') {
+      clearInterval(pollTimer);
+      await loadList();
+      openDetail(contractId);
+    }
+  } catch (e) { /* 轮询失败时保留当前详情 */ }
+}
+
+async function postAction(id, action) {
+  try {
+    await apiJSON('/api/workbench/contracts/' + id + '/' + action, { method: 'POST' });
+    await loadList();
+    openDetail(id);
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+let qTimer = null;
+document.getElementById('wbQ').addEventListener('input', () => {
+  clearTimeout(qTimer);
+  qTimer = setTimeout(loadList, 250);
+});
+
+window.onRole = function () {
+  if (selected) openDetail(selected);
+  else loadList();
+};
+initPage('workbench');
+renderTabs();
+loadList();
+</script>
+</body>
+</html>

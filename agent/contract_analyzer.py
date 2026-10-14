@@ -21,6 +21,7 @@ contract_analyzer.py —— 合同 8 维审查引擎
 立场写在 _DIM_PROMPT 里：默认站在甲方看不利条款。这是提示词约定，
 不是另一套规则引擎。
 """
+import json
 import os
 import re
 
@@ -199,6 +200,31 @@ def _has_dim_hits(docs, dim: dict) -> bool:
     return any(k in text for k in kws)
 
 
+def _location_of(docs, evidence: str) -> str:
+    """从本次检索片段里取位置。没有 chunk_index / 页码就返回空，不另调模型。"""
+    if not docs:
+        return ""
+    needle = re.sub(r"\s+", "", (evidence or ""))[:40]
+    best = docs[0]
+    if needle:
+        for doc in docs:
+            chunk = re.sub(r"\s+", "", getattr(doc, "page_content", "") or "")
+            if needle in chunk or (len(chunk) >= 24 and chunk[:24] in needle):
+                best = doc
+                break
+    meta = getattr(best, "metadata", None) or {}
+    loc = {}
+    if meta.get("chunk_index") is not None:
+        loc["chunk_index"] = meta.get("chunk_index")
+    if meta.get("page") is not None:
+        loc["page"] = meta.get("page")
+    if meta.get("source"):
+        loc["source"] = str(meta.get("source"))[:120]
+    if "chunk_index" not in loc and "page" not in loc:
+        return ""
+    return json.dumps(loc, ensure_ascii=False)
+
+
 def analyze_dimension(filename: str, dim: dict, stream: bool = True, emit=None,
                       owner: str = None) -> dict:
     """对单个风险维度做定向检索 + 大模型流式分析，返回结构化结果。
@@ -273,6 +299,7 @@ def analyze_dimension(filename: str, dim: dict, stream: bool = True, emit=None,
                 "missing_tip",
                 "合同对该内容未作约定，存在风险，建议补充完善并与对方书面确认。",
             )
+    parsed["location"] = _location_of(docs, parsed.get("evidence") or "")
     return parsed
 
 

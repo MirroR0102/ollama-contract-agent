@@ -158,6 +158,54 @@ def retry_llm_call(fn, retries: int = MAX_RETRY):
     raise RuntimeError("unreachable")
 
 
+def _brief_error(exc, limit: int = 160) -> str:
+    """把异常压成单行短句，避免健康检查把堆栈或超长信息回给前端。"""
+    msg = f"{type(exc).__name__}: {exc}"
+    msg = " ".join(str(msg).split())
+    if len(msg) <= limit:
+        return msg
+    return msg[: limit - 1] + "…"
+
+
+def probe(timeout: float = 1.5) -> dict:
+    """短超时探活 Ollama（GET /api/tags）。失败只返回 ok=false，不抛异常。
+
+    models 为已安装模型名列表；服务不可达或列表无法解析时为 None。
+    """
+    import json
+    import urllib.request
+
+    host = (OLLAMA_HOST or "http://localhost:11434").rstrip("/")
+    out = {"ok": False, "host": host, "detail": "", "models": None}
+    try:
+        req = urllib.request.Request(host + "/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+        try:
+            data = json.loads(body.decode("utf-8", errors="replace") or "{}")
+        except Exception as e:  # noqa: BLE001
+            out["ok"] = True
+            out["detail"] = "服务可达，但无法解析模型列表：" + _brief_error(e)
+            return out
+        names = []
+        for item in (data.get("models") or []):
+            if isinstance(item, dict):
+                name = (item.get("name") or item.get("model") or "").strip()
+            else:
+                name = str(item or "").strip()
+            if name:
+                names.append(name)
+        out["ok"] = True
+        out["models"] = names
+        out["detail"] = f"可达，已安装 {len(names)} 个模型"
+        return out
+    except Exception as e:  # noqa: BLE001
+        out["ok"] = False
+        out["models"] = None
+        out["detail"] = "不可达：" + _brief_error(e)
+        return out
+
+
 def retry_emb_call(fn, retries: int = MAX_RETRY):
     """执行一次 Embedding 相关调用 fn()；若抛连接类错误，重建 Embedding 后重试。
 

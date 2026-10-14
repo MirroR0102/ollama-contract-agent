@@ -19,6 +19,7 @@ if __name__ == "__main__":
     print(f"  本地模型：{LLM_MODEL_NAME} ｜ 云端模型：{_c['model']}"
           f"{'（已配置）' if _c['ready'] else '（未配置 Key，可在网页端设置）'}")
     print("  服务：http://localhost:8000（右上角「模型设置」可切换 本地/云端）")
+    print("  健康检查：http://localhost:8000/api/health（无需登录）")
     print("  预置演示账号：demo / demo123（含保密协议等演示合同）")
     print("  Ctrl+C 退出")
     print("=" * 60)

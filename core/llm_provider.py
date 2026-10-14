@@ -91,6 +91,21 @@ def effective_cloud_cfg() -> dict:
     }
 
 
+def provider_health() -> dict:
+    """健康检查用的引擎摘要：当前 local/cloud，以及云端是否已配置。不含密钥。"""
+    st = cloud_status()
+    return {
+        "provider": get_provider(),
+        "cloud_configured": bool(st.get("ready")),
+        "cloud": {
+            "base_url": st.get("base_url") or "",
+            "model": st.get("model") or "",
+            "ready": bool(st.get("ready")),
+            "key_source": st.get("key_source") or "none",
+        },
+    }
+
+
 def cloud_status(personal_key: str = None, personal_model: str = None) -> dict:
     """给网页端展示的云端状态（绝不返回密钥明文，只给可见信息与来源标记）。"""
     env_key = (CLOUD_API_KEY or "").strip()

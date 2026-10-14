@@ -26,7 +26,7 @@
 ```
 ollama_contract_agent/
 ├── app.py / main.py          # 入口薄壳：python app.py(网页) / python main.py(命令行)
-├── .env / .env.example       # Ollama / MySQL 配置（.env 含密码不入库）
+├── .env / .env.example       # 环境变量（开发默认 SQLite；.env 含密钥不入库）
 ├── requirements.txt          # 依赖清单
 ├── core/                     # ① 底层：配置与大模型/向量连接
 │   ├── config.py             #   全局配置（本地/云端模型/向量库/审查维度/数据库）
@@ -62,77 +62,100 @@ ollama_contract_agent/
 > `from agent.x import ...`）；请在项目根目录运行入口脚本（`./chroma_db`、`./contracts`
 > 为相对当前工作目录路径）。
 
-## 三、环境准备（模型导入指引）
+## 三、环境准备
 
-### 1. 安装 Ollama
-官网 https://ollama.com/ 下载安装包，完成后**重启终端**，确认服务运行在 `http://localhost:11434`。
+在项目根目录操作。开发默认 **SQLite**，不需要单独安装数据库。生成类功能的推荐验收路径是 **云端 DeepSeek**；本地 Ollama 是可选离线方案。
 
-### 2. 下载本项目需要的 2 个模型
-在终端执行（本项目所有配置已指向这两个模型，无需改代码）：
-
-```bash
-# ① 大语言模型：负责问答 / 审查 / 抽取 / Agent 推理
-ollama pull qwen2.5:7b
-
-# ② 向量嵌入模型：负责合同文档向量化检索
-ollama pull bge-m3
-```
-
-> 设备性能有限可换小模型：`ollama pull qwen2.5:3b`（把 `.env` 里 `LLM_MODEL` 改掉即可）；
-> 嵌入模型也可用 `bge-small` / `nomic-embed-text`（改 `.env` 的 `EMBED_MODEL`）。
-> 模型名与配置不一致时会报错——改模型只需改 `.env`，端口默认 11434 不用动。
-
-### 3. 验证模型可用
-```bash
-ollama list          # 应能看到 qwen2.5:7b 与 bge-m3
-ollama run qwen2.5:7b   # 输入"你好"，正常回复即成功，输入 /bye 退出
-```
-
-### 4. 安装 Python 依赖
+### 1. 安装 Python 依赖
 ```bash
 pip install -r requirements.txt
 ```
-
-### 5.（可选）配置云端大模型（联网模式）
-> 不配置也能用——默认全程本地 Ollama 离线推理；配置后可在网页端一键切换，获得更强的生成质量。
-
-在 `.env` 中填入任意 **OpenAI 兼容** 服务的配置（以 DeepSeek 为例）：
-
+起草导出 PDF 依赖 `reportlab`。装完可确认：
 ```bash
-CLOUD_BASE_URL=https://api.deepseek.com   # 兼容：通义/Kimi/硅基流动/OpenAI 等
-CLOUD_API_KEY=sk-...                      # 留空则只能由用户在网页端填个人 Key
-CLOUD_MODEL=deepseek-flash                # 按服务商文档填写模型名
+python -c "import reportlab; print('reportlab ok')"
 ```
 
-* 网页端**右上角「模型设置」**可随时在 本地 ⇄ 云端 之间切换（按账号独立保存，重启后仍生效）；
-* 未在 `.env` 配置时，用户也可在弹窗中填写**个人 Key**（仅存本机数据库、按账号隔离）；
-* ⚠️ 联网模式下，检索到的合同片段会发送至云端服务商；**敏感合同请继续使用本地模式**。
+### 2. 准备环境变量
+```bash
+# Windows 可把 copy 换成：copy .env.example .env
+cp .env.example .env
+```
+`.env.example` 里 `DB_ENGINE=sqlite`，数据库文件为 `DB_PATH=./contract_ai.db`。不要把真实密钥写进仓库。
 
-> 嵌入（embedding）始终使用本地 bge-m3，不走云端，原因见「五、核心技术设计」。
+**推荐验收配置（云端 DeepSeek）**，在 `.env` 中设置为：
+
+```bash
+LLM_PROVIDER=cloud
+CLOUD_BASE_URL=https://api.deepseek.com/v1
+CLOUD_API_KEY=sk-...                 # 到 https://platform.deepseek.com 创建，勿提交到 git
+CLOUD_MODEL=deepseek-chat            # 或当前账号可用的 DeepSeek 模型名
+DB_ENGINE=sqlite
+```
+
+* 网页端**右上角「模型设置」**可随时在 本地 ⇄ 云端 之间切换（按账号独立保存）；
+* `.env` 未填 `CLOUD_API_KEY` 时，用户也可在弹窗中填写**个人 Key**（只存在本机数据库）；
+* ⚠️ 联网模式下，检索到的合同片段会发送至云端服务商。
+
+**改回 MySQL（生产可选）**：安装 MySQL 8.0+ 后，把 `DB_ENGINE` 改为 `mysql`，并填写 `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME`。数据库完全不可用时，进程会按现有启动逻辑失败退出；Ollama 不可达只打印警告，不阻止启动。
+
+### 3. 启动
+```bash
+python app.py
+```
+浏览器打开 http://localhost:8000 。首次启动会建库并预置演示账号 `demo` / `demo123`。
+
+无需登录即可查看环境：
+
+```bash
+curl -s http://127.0.0.1:8000/api/health
+```
+
+`GET /api/health`（同等路径 `GET /health`）返回数据库、Ollama、配置的模型是否在本机、当前引擎是 `local` 还是 `cloud`、以及 Chroma 目录是否可写。Ollama 没开时接口仍是 200，`ollama.ok` 为 `false`，`ok` 只要数据库可用就为 `true`。登录后的导航栏会用绿/黄/红提示数据库和 Ollama 状态。
+
+### 4.（可选）本地 Ollama 离线方案
+需要离线推理，或要做合同入库/检索时再安装。嵌入模型固定走本地，不走云端（原因见「五、核心技术设计」）。不装 Ollama 也可以按上一节用云端完成生成类验收。
+
+1. 安装 Ollama：https://ollama.com/ ，完成后重启终端，默认地址 `http://localhost:11434`（`.env` 的 `OLLAMA_HOST`）。
+2. 需要本地对话模型时：`ollama pull qwen2.5:7b`（机器较小时可改为 `qwen2.5:3b`，并同步改 `LLM_MODEL`）。
+3. 需要入库/检索时：`ollama pull bge-m3`（备选 `bge-small` / `nomic-embed-text`，改 `EMBED_MODEL`）。换嵌入模型后要重建 `chroma_db`。
+4. 自检：`ollama list`。把 `LLM_PROVIDER` 改回 `local` 即走本地生成。
 
 ## 四、快速运行
 
 ```bash
-# 方式零：网页版（推荐答辩演示，浏览器访问 http://localhost:8000）
+# 方式零：网页版（推荐，浏览器访问 http://localhost:8000）
 python app.py
 # 页面：/login 登录注册（默认演示账号 demo/demo123）→ /kb 知识库问答  / 智能体对话  /review 合同审查  /ingest 合同入库
-# 右上角「模型设置」可切换 本地/云端 模型引擎（云端需 .env 配置 CLOUD_API_KEY 或由用户填个人 Key）
+# 右上角「模型设置」可切换 本地/云端；验收请使用 LLM_PROVIDER=cloud
+# 健康检查：http://localhost:8000/api/health
 # 首次启动自动建库并预置演示账号；注册新账号后上传的合同自动归属该账号
 
-# 方式一：菜单式全流程（命令行演示）
+# 方式一：菜单式全流程（命令行演示；调用大模型时同样跟随 LLM_PROVIDER）
 python main.py
 
-# 方式二：直接进入 Agent 多轮对话
-python agent_run.py
+# 方式二：直接进入 Agent 多轮对话（在项目根目录执行）
+python -m agent.agent_run
 
-# 方式三：单模块自检（需先入库）
-python embedding_client.py     # 检查嵌入模型连通
-python document_loader.py      # 检查文档分块效果
-python vector_store.py         # 查看向量库状态
-python contract_kb.py          # 测试知识库问答
-python contract_analyzer.py    # 测试合同审查
-python element_extractor.py    # 测试要素抽取
+# 方式三：单模块自检（在项目根目录执行；嵌入/入库相关项需要可选的本地 Ollama）
+python -m core.embedding_client      # 检查嵌入模型连通
+python -m store.document_loader      # 检查文档分块效果
+python -m store.vector_store         # 查看向量库状态
+python -m agent.contract_kb          # 测试知识库问答
+python -m agent.contract_analyzer    # 测试合同审查
+python -m agent.element_extractor    # 测试要素抽取
 ```
+
+后续若要容器化，可再加 docker-compose；本阶段不提供编排文件。
+
+### 合同状态与工作台
+登录后进入 `/workbench`。合同状态为 `uploaded`（待入库）→ `ingesting` → `ready`（可审查）→ `reviewing` → `reviewed`，失败是 `failed`，`ready` / `reviewed` 可归档为 `archived`。升级前已经在库里的合同默认 `ready`。审查、抽取和报告解读会回写对应合同；入库分析（还没有合同记录）和全库巡检不改某一份合同的状态。`/review`、`/ingest` 等旧页面仍可直接打开。
+
+### 审查发现与报告导出
+一次审查全部完成后，结果写入 `review_findings`，只保留该合同最近一次审查。刷新审查页后仍可在「发现列表」查看原文摘录和意见。处理状态为 `open`（未处理）、`accepted`（已接受）、`dismissed`（已忽略）、`fixed`（已修改）。同一维度、同一段原文再次审到时，已接受、已忽略、已修改的结论会保留。导出 Word / PDF 以这些记录为准，不重新生成散文。手动验收：工作台打开合同 → 去审查 → 在发现列表改状态 → 导出 docx 或 pdf。功能验收使用云端模型（`.env` 里 `LLM_PROVIDER=cloud`）；检索嵌入仍走本地模型。
+
+### 角色与审计
+三个角色：`admin` 管用户、角色、审计和模型设置，也能做审查入库；`legal` 做上传、入库、审查、改发现、导出和归档，不能进管理页；`viewer` 只能看工作台、发现和已有报告，不能开始审查、入库、改状态或删合同。新注册用户默认 `legal`。库里还没有用户时，第一个注册的人是 `admin`。启动时如果还没有任何管理员，会把 `BOOTSTRAP_ADMIN_USERNAME` 指定的用户升为 admin；该项留空则提升最早注册的用户（通常是 demo）。演示账号仍在，角色可在 `/admin` 改回去。审计记登录成败、入库、开始审查、导出、发现状态、归档、删合同、改角色和模型设置（只记是否更新了密钥，不记密钥和密码）。
+验证：用 admin 在 `/admin` 把某个账号改成 viewer，再用该账号调开始审查、改发现或删合同，接口应返回 403。
 
 ### 演示动线建议（覆盖 20 分钟答辩）
 1. **开场**：项目背景（企业合同数据敏感不可上云 → 本地私有化 RAG/Agent）

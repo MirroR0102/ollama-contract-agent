@@ -77,7 +77,8 @@ async function initUserBar() {
   right.innerHTML = '<span class="user-name"></span>' +
     '<button type="button" class="btn btn-ghost btn-sm" id="logoutBtn">退出</button>';
   nav.appendChild(right);
-  initModelPicker(right);   // 模型引擎切换（本地 ⇄ 云端，全站可用）
+  initModelPicker(right);   // 模型切换仅管理员可用，角色返回后再显示
+  initServiceHealth(right); // DB / Ollama 探活（所有带导航栏的页面共用）
   const logoutBtn = right.querySelector('#logoutBtn');
   logoutBtn.addEventListener('click', async () => {
     try { await apiFetch('/api/auth/logout', { method: 'POST' }); } catch (e) { /* ignore */ }
@@ -87,22 +88,107 @@ async function initUserBar() {
   try {
     const me = await apiJSON('/api/me');
     right.querySelector('.user-name').textContent = '👤 ' + (me.display_name || me.username);
+    applyRole(me.role);
   } catch (e) {
     right.querySelector('.user-name').textContent = '';
   }
 }
 
+/**
+ * 导航栏左侧状态点：绿=正常，黄=本地模型或 Ollama 异常，红=数据库或探活失败。
+ * 云端已配置时，Ollama 离线只提示「本地离线（云端可用）」，不按故障标红。
+ * 走无需登录的 /api/health，不用 apiFetch，避免探活失败被当成登录过期。
+ */
+function initServiceHealth(userBar) {
+  if (!userBar || userBar.querySelector('.health-dot')) return;
+  const el = document.createElement('span');
+  el.className = 'health-dot health-wait';
+  el.textContent = '检测中';
+  el.title = '正在检查数据库、本地模型与云端配置';
+  userBar.insertBefore(el, userBar.firstChild);
+  fetch('/api/health').then(r => {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then(h => {
+    const dbOk = !!(h && h.db && h.db.ok);
+    const olOk = !!(h && h.ollama && h.ollama.ok);
+    const models = (h && h.models) || {};
+    const prov = (h && h.llm_provider) || {};
+    const cloud = prov.cloud || {};
+    const cloudReady = !!(prov.cloud_configured || cloud.ready);
+    const modelMissing = models.llm_present === false || models.embed_present === false;
+    let level = 'ok';
+    let text = '服务正常';
+    if (!dbOk) {
+      level = 'bad';
+      text = '数据库异常';
+    } else if (!olOk && cloudReady) {
+      level = 'warn';
+      text = '本地离线（云端可用）';
+    } else if (!olOk) {
+      level = 'warn';
+      text = 'Ollama 离线';
+    } else if (modelMissing || models.llm_present == null) {
+      level = 'warn';
+      text = modelMissing ? '本地模型缺失' : '模型未知';
+    }
+    el.className = 'health-dot health-' + level;
+    el.textContent = text;
+    const db = (h && h.db) || {};
+    const ol = (h && h.ollama) || {};
+    el.title = [
+      'DB(' + (db.engine || '?') + '): ' + (db.detail || ''),
+      'Ollama: ' + (ol.detail || ''),
+      '引擎: ' + (prov.provider || ''),
+      '云端: ' + (cloudReady ? '已配置' : '未配置'),
+    ].join(' | ');
+  }).catch(() => {
+    el.className = 'health-dot health-bad';
+    el.textContent = '状态未知';
+    el.title = '无法获取 /api/health';
+  });
+}
+
 /* ==================== 页面基础 ==================== */
 /** 顶部导航高亮当前页 */
 function initNav(active) {
+  const nav = document.querySelector('.navbar nav');
+  if (nav && !nav.querySelector('a[data-page="workbench"]')) {
+    const a = document.createElement('a');
+    a.href = '/workbench';
+    a.dataset.page = 'workbench';
+    a.textContent = '🗂️ 工作台';
+    nav.insertBefore(a, nav.firstChild);
+  }
   document.querySelectorAll('.navbar nav a').forEach(a => {
     a.classList.toggle('active', a.dataset.page === active);
   });
 }
 
 /** 每个页面统一入口：登录守卫 + 导航高亮 + 用户栏（先登录再渲染） */
+function applyRole(role) {
+  const r = role || 'legal';
+  document.body.dataset.role = r;
+  window.CURRENT_ROLE = r;
+  const nav = document.querySelector('.navbar nav');
+  if (r === 'admin' && nav && !nav.querySelector('a[data-page="admin"]')) {
+    const a = document.createElement('a');
+    a.href = '/admin';
+    a.dataset.page = 'admin';
+    a.textContent = '🛠️ 管理';
+    nav.appendChild(a);
+  }
+  document.querySelectorAll('.navbar nav a').forEach(a => {
+    a.classList.toggle('active', a.dataset.page === (document.body.dataset.page || ''));
+  });
+  const bar = document.querySelector('.model-bar');
+  if (bar) bar.style.display = r === 'admin' ? '' : 'none';
+  if (typeof window.onRole === 'function') window.onRole(r);
+}
+
 function initPage(active) {
   if (!requireAuth()) return;
+  document.body.dataset.page = active || '';
   initNav(active);
   initUserBar();
 }
@@ -353,6 +439,7 @@ function applyModelStatus(st) {
 function initModelPicker(userBar) {
   const wrap = document.createElement('div');
   wrap.className = 'model-bar';
+  wrap.style.display = 'none';
   wrap.innerHTML = `
     <select class="model-select" id="modelSelect" title="选择模型引擎">
       <option value="local">🏠 本地模型</option>

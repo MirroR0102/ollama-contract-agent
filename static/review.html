@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>合同审查 · Contract AI</title>
-<link rel="stylesheet" href="/static/style.css?v=3">
+<link rel="stylesheet" href="/static/style.css?v=8">
 </head>
 <body>
   <header class="navbar">
@@ -58,6 +58,7 @@
 
       <div id="viewTabs" style="display:none;margin-top:18px;gap:8px;align-items:center;">
         <button type="button" class="btn viewtab active" data-v="dims">📊 分维度明细</button>
+        <button type="button" class="btn viewtab" data-v="findings">📌 发现列表</button>
         <button type="button" class="btn viewtab" data-v="report">🤖 报告解读</button>
         <span id="reportStatus" style="color:var(--muted);font-size:12px;"></span>
       </div>
@@ -69,10 +70,32 @@
       <div class="result-box" id="reportView" style="display:none;">
         <div class="empty-tip">审查完成后可切换到「🤖 报告解读」查看智能体总结</div>
       </div>
+
+      <div class="result-box" id="findingsView" style="display:none;">
+        <div class="find-bar">
+          <select id="findFilter">
+            <option value="">全部</option>
+            <option value="open">未处理</option>
+            <option value="accepted">已接受</option>
+            <option value="dismissed">已忽略</option>
+            <option value="fixed">已修改</option>
+          </select>
+          <select id="expScope">
+            <option value="all">导出全部</option>
+            <option value="actionable">仅未处理与已接受</option>
+          </select>
+          <select id="expFmt">
+            <option value="docx">Word</option>
+            <option value="pdf">PDF</option>
+          </select>
+          <button type="button" class="btn btn-primary btn-sm" id="expBtn">导出报告</button>
+        </div>
+        <div id="findList"></div>
+      </div>
     </div>
   </main>
 
-<script src="/static/main.js?v=3"></script>
+<script src="/static/main.js?v=8"></script>
 <script>
 initPage('review');
 const fileSelect = document.getElementById('fileSelect');
@@ -116,7 +139,15 @@ async function loadFiles() {
     const j = await apiJSON('/api/files');
     document.getElementById('modelTag').textContent = '模型：' + j.model + ' ｜ 知识库切片：' + (j.stats?.total_chunks ?? 0);
     fileSelect.innerHTML = '<option value="">— 请选择合同 —</option>' +
-      j.files.map(f => `<option value="${esc(f.name)}">${esc(f.name)}</option>`).join('');
+      j.files.map(f => `<option value="${esc(f.name)}" data-id="${f.id}">${esc(f.title || f.name)}</option>`).join('');
+    const params = new URLSearchParams(location.search);
+    const want = params.get('file') || '';
+    const wantId = params.get('contract_id') || '';
+    if (want) fileSelect.value = want;
+    if (!fileSelect.value && wantId) {
+      const opt = [...fileSelect.options].find(o => o.dataset.id === String(wantId));
+      if (opt) fileSelect.value = opt.value;
+    }
   } catch (e) {
     document.getElementById('modelTag').textContent = '加载文件列表失败';
   }
@@ -172,6 +203,7 @@ function resetSummaryUI() {
   sessionStorage.removeItem(SUMMARY_JOB_KEY);
   viewTabs.style.display = 'none';
   reportView.style.display = 'none';
+  findingsView.style.display = 'none';
   reportView.innerHTML = '';
   sumBubble = null;
   currentView = 'dims';
@@ -187,7 +219,9 @@ function switchView(v) {
   document.querySelectorAll('#viewTabs .viewtab').forEach(b => b.classList.toggle('active', b.dataset.v === v));
   reportBox.style.display = (v === 'dims') ? '' : 'none';
   reportView.style.display = (v === 'report') ? '' : 'none';
+  findingsView.style.display = (v === 'findings') ? '' : 'none';
   if (v === 'report') maybeStartSummary();
+  if (v === 'findings') loadFindings();
 }
 function buildSummaryBubble() {
   reportView.innerHTML = '';
@@ -418,7 +452,9 @@ function onDone() {
   try { if (results.length) sessionStorage.setItem(RESULT_KEY, JSON.stringify({ filename: reviewingName, results })); } catch (_) { /* noop */ }
   clearJobStorage();
   closeES();
-  if (results.length) showResultTabs(true);   // 审查结束 → 收起明细、切到报告解读
+  loadFindings().finally(() => {
+    if (results.length) showResultTabs(true);   // 审查结束 → 收起明细、切到报告解读
+  });
 }
 function onError(msg) {
   stopTimer();
@@ -625,7 +661,145 @@ stopBtn.addEventListener('click', async () => {
     }
   } catch (_) { onError('操作失败'); }
 });
-loadFiles();
+const findingsView = document.getElementById('findingsView');
+const SEV_LABEL = { high: '高', medium: '中', low: '低', info: '提示' };
+const ST_LABEL = { open: '未处理', accepted: '已接受', dismissed: '已忽略', fixed: '已修改' };
+let contractId = null;
+let findings = [];
+
+function selectedContractId() {
+  const opt = fileSelect.selectedOptions && fileSelect.selectedOptions[0];
+  const id = opt && opt.dataset ? opt.dataset.id : '';
+  return id ? Number(id) : null;
+}
+
+function locationLine(raw) {
+  if (!raw) return '';
+  let loc = null;
+  try { loc = JSON.parse(raw); } catch (_) { loc = null; }
+  let text = '';
+  if (loc && typeof loc === 'object') {
+    const bits = [];
+    if (loc.page != null && loc.page !== '') bits.push('第' + (Number(loc.page) + 1) + ' 页');
+    if (loc.chunk_index != null && loc.chunk_index !== '') bits.push('片段 ' + loc.chunk_index);
+    if (loc.source) bits.push(String(loc.source));
+    text = bits.join(' · ');
+  } else {
+    text = String(raw);
+  }
+  if (!text) return '';
+  return '<div class="lbl">📍 位置</div><div class="find-loc">' + esc(text) + '</div>';
+}
+
+function renderFindings() {
+  const list = document.getElementById('findList');
+  if (!contractId) {
+    list.innerHTML = '<div class="empty-tip">选择合同后可查看已保存的风险</div>';
+    return;
+  }
+  if (!findings.length) {
+    list.innerHTML = '<div class="empty-tip">这份合同还没有已保存的审查发现。完成一次审查后会写在这里，刷新仍然在。</div>';
+    return;
+  }
+  list.innerHTML = findings.map(f => `
+    <article class="find-item" data-id="${f.id}">
+      <button type="button" class="find-head">
+        <span class="sev sev-${esc(f.severity)}">${esc(SEV_LABEL[f.severity] || f.severity)}</span>
+        <strong>${esc(f.dimension || '')}</strong>
+        <span class="find-title">${esc(f.title || '')}</span>
+        <span class="st">${esc(ST_LABEL[f.status] || f.status)}</span>
+      </button>
+      <div class="find-body">
+        <div class="lbl">📌 原文摘录</div>
+        <div class="evidence-text">${esc(f.quote || '（无）')}</div>
+        ${locationLine(f.location)}
+        <div class="lbl">💡 审查意见</div>
+        <div class="op">${esc(f.detail || '')}</div>
+        <div class="find-edit">
+          <select class="find-status">
+            ${['open','accepted','dismissed','fixed'].map(s =>
+              `<option value="${s}"${s === f.status ? ' selected' : ''}>${ST_LABEL[s]}</option>`).join('')}
+          </select>
+          <input class="find-note" type="text" maxlength="500" placeholder="处理备注" value="${esc(f.note || '')}">
+          <button type="button" class="btn btn-sm find-save">保存</button>
+        </div>
+      </div>
+    </article>`).join('');
+  list.querySelectorAll('.find-head').forEach(btn => {
+    btn.addEventListener('click', () => btn.parentElement.classList.toggle('open'));
+  });
+  list.querySelectorAll('.find-save').forEach(btn => {
+    btn.addEventListener('click', () => saveFinding(btn.closest('.find-item')));
+  });
+}
+
+async function loadFindings() {
+  contractId = selectedContractId();
+  if (!contractId) {
+    findings = [];
+    renderFindings();
+    return;
+  }
+  const status = document.getElementById('findFilter').value;
+  const q = status ? ('?status=' + encodeURIComponent(status)) : '';
+  try {
+    const data = await apiJSON('/api/contracts/' + contractId + '/findings' + q);
+    findings = data.findings || [];
+  } catch (e) {
+    findings = [];
+    document.getElementById('findList').innerHTML = '<div class="empty-tip">' + esc(e.message) + '</div>';
+    return;
+  }
+  renderFindings();
+  if (contractId && !running) viewTabs.style.display = 'flex';
+}
+
+async function saveFinding(article) {
+  const id = article && article.dataset.id;
+  if (!id) return;
+  const status = article.querySelector('.find-status').value;
+  const note = article.querySelector('.find-note').value;
+  try {
+    await apiJSON('/api/findings/' + id, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status, note }),
+    });
+    await loadFindings();
+  } catch (e) {
+    alert(e.message || '保存失败');
+  }
+}
+
+async function exportReport() {
+  if (!contractId) { alert('请先选择合同'); return; }
+  const fmt = document.getElementById('expFmt').value;
+  const scope = document.getElementById('expScope').value;
+  const res = await fetch('/api/contracts/' + contractId + '/report/export?format=' +
+    encodeURIComponent(fmt) + '&scope=' + encodeURIComponent(scope), {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + getToken() },
+  });
+  if (!res.ok) {
+    let msg = '导出失败';
+    try { const j = await res.json(); msg = j.detail || msg; } catch (_) { /* noop */ }
+    alert(typeof msg === 'string' ? msg : '导出失败');
+    return;
+  }
+  const blob = await res.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = '审查报告.' + fmt;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(a.href);
+}
+
+loadFiles().then(() => loadFindings());
+fileSelect.addEventListener('change', () => loadFindings());
+document.getElementById('findFilter').addEventListener('change', () => loadFindings());
+document.getElementById('expBtn').addEventListener('click', exportReport);
 maybeRestore();
 maybeRestoreFinished();   // 已完成审查结果 + 报告解读恢复
 </script>

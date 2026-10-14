@@ -42,15 +42,39 @@ def verify_password(password: str, stored: str) -> bool:
 
 
 def register_user(username: str, password: str, display_name: str = "") -> dict:
-    """注册新用户；用户名已存在返回 None。成功后返回用户 dict。"""
+    """注册新用户；用户名已存在返回 None。成功后返回用户 dict。
+
+    库里还没有用户时，第一个注册用户是 admin；其余默认 legal。
+    """
     store = get_store()
     username = username.strip()
     if not username or not password:
         return None
-    uid = store.create_user(username, hash_password(password), display_name or username)
+    role = "admin" if store.count_users() == 0 else "legal"
+    uid = store.create_user(username, hash_password(password), display_name or username, role=role)
     if uid < 0:
         return None
     return store.get_user_by_id(uid)
+
+
+def ensure_bootstrap_admin() -> None:
+    """若系统里还没有 admin：优先提升 BOOTSTRAP_ADMIN_USERNAME，否则提升最早的用户。"""
+    from core.config import BOOTSTRAP_ADMIN_USERNAME
+    store = get_store()
+    try:
+        if store.count_role("admin"):
+            return
+        name = (BOOTSTRAP_ADMIN_USERNAME or "").strip()
+        user = store.get_user_by_name(name) if name else None
+        if not user:
+            users = store.list_users() or []
+            user = users[0] if users else None
+        if not user:
+            return
+        store.set_user_role(user["id"], "admin")
+        print(f"[auth] 尚无管理员，已将 {user.get('username') or user['id']} 设为 admin", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[auth] 管理员引导失败：{e}", flush=True)
 
 
 def login(username: str, password: str) -> dict:
@@ -66,6 +90,7 @@ def login(username: str, password: str) -> dict:
         "id": user["id"],
         "username": user["username"],
         "display_name": user.get("display_name") or user["username"],
+        "role": user.get("role") or "legal",
     }
 
 

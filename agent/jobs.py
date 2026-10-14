@@ -64,11 +64,13 @@ class JobAbort(Exception):
 
 
 class Job:
-    def __init__(self, kind: str, filename: str, target, owner: str = None):
+    def __init__(self, kind: str, filename: str, target, owner: str = None,
+                 contract_id=None):
         self.id = uuid.uuid4().hex[:12]
         self.kind = kind          # review / extract
         self.filename = filename
         self.owner = owner        # 归属用户名（鉴权用）
+        self.contract_id = contract_id  # 优先用于回写合同状态；可空
         self.status = "running"   # running / done / error / aborted / paused
         self.error = None
         # 通用进度字段（worker 更新，SSE 订阅端读取）
@@ -91,20 +93,36 @@ class Job:
         self._thread.start()
         return self
 
+    def _sync_contract(self, phase: str) -> None:
+        try:
+            from store.contract_status import sync_job_contract
+            sync_job_contract(self, phase)
+        except Exception as e:  # noqa: BLE001
+            print(f"[status] 任务 {self.id} 回写异常：{e}", flush=True)
+
     def _run(self):
+        self._sync_contract("start")
         try:
             self._target(self)
             with self._lock:
-                if self.status == "running":
+                final = self.status
+                if final == "running":
                     self.status = "done"
+                    final = "done"
+            if final == "done":
+                self._sync_contract("ok")
+            elif final in ("error", "aborted"):
+                self._sync_contract("fail")
         except JobAbort:
             with self._lock:
                 if self.status != "paused":
                     self.status = "aborted"
+            self._sync_contract("fail")
         except Exception as e:  # noqa: BLE001
             with self._lock:
                 self.status = "error"
                 self.error = _friendly_error(f"{type(e).__name__}: {e}")
+            self._sync_contract("fail")
 
     def abort(self, reason: str = "任务已中止"):
         """彻底终止任务（不再可恢复）。"""
@@ -213,6 +231,7 @@ class Job:
             "id": self.id,
             "kind": self.kind,
             "filename": self.filename,
+            "contract_id": self.contract_id,
             "status": self.status,
             "error": self.error,
             "total": self.total,
@@ -234,7 +253,7 @@ _jobs_lock = threading.Lock()
 
 
 def create_job(kind: str, filename: str, target, owner: str = None,
-               payload=None) -> Job:
+               payload=None, contract_id=None) -> Job:
     with _jobs_lock:
         # 清理已完成旧任务，防止无限增长
         if len(_jobs) > 50:
@@ -242,7 +261,11 @@ def create_job(kind: str, filename: str, target, owner: str = None,
             for j in list(_jobs.values()):
                 if j.status != "running" and now - j.last_seen > 3600:
                     _jobs.pop(j.id, None)
-        job = Job(kind, filename, target, owner=owner)
+        job = Job(kind, filename, target, owner=owner, contract_id=contract_id)
+        if isinstance(payload, dict):
+            payload = dict(payload)
+            if contract_id is not None:
+                payload.setdefault("contract_id", contract_id)
         if payload is not None:
             job.payload = payload
         _jobs[job.id] = job

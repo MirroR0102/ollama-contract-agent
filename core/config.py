@@ -53,6 +53,9 @@ CLOUD_API_KEY = os.getenv("CLOUD_API_KEY", "")
 CLOUD_MODEL_NAME = os.getenv("CLOUD_MODEL", "deepseek-chat")
 CLOUD_TIMEOUT = int(os.getenv("CLOUD_TIMEOUT", "600"))  # 单次云端请求最长 10 分钟
 
+# 尚无 admin 时，启动把该用户名升为管理员。留空则提升最早注册的用户。
+BOOTSTRAP_ADMIN_USERNAME = os.getenv("BOOTSTRAP_ADMIN_USERNAME", "").strip()
+
 # 默认模型引擎：local（本地 Ollama，离线）/ cloud（云端 API）
 # 网页端登录用户可在「模型设置」中覆盖；命令行直接使用本默认值。
 LLM_DEFAULT_PROVIDER = os.getenv("LLM_PROVIDER", "local").strip().lower()

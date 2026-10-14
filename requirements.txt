@@ -20,3 +20,6 @@ pymysql
 # ---- 文档接入（多格式入库：docx / 图片 OCR） ----
 python-docx
 rapidocr-onnxruntime
+numpy
+# ---- 起草导出 PDF（agent/draft_export.py） ----
+reportlab

@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>管理 · Contract AI</title>
+<link rel="stylesheet" href="/static/style.css?v=8">
+</head>
+<body>
+  <header class="navbar">
+    <div class="brand"><span class="logo">&#9878;&#65039;</span> Contract AI</div>
+    <nav>
+      <a href="/workbench" data-page="workbench">🗂️ 工作台</a>
+      <a href="/kb" data-page="kb">📚 知识库问答</a>
+      <a href="/" data-page="chat">🤖 智能体对话</a>
+      <a href="/draft" data-page="draft">📝 AI 起草</a>
+      <a href="/review" data-page="review">📋 合同审查</a>
+      <a href="/inspect" data-page="inspect">📊 合同巡检</a>
+      <a href="/ingest" data-page="ingest">📤 合同入库</a>
+      <a href="/admin" data-page="admin">🛠️ 管理</a>
+    </nav>
+  </header>
+  <main class="container">
+    <div class="card" id="deny" hidden>
+      <div class="page-title">需要管理员权限</div>
+      <p class="page-sub">当前账号不能打开管理页。请用管理员登录，或请管理员在这里把角色改为 admin。</p>
+    </div>
+    <div id="panel" hidden>
+      <div class="card">
+        <div class="page-title">🛠️ 用户与角色</div>
+        <p class="page-sub">只能改角色，看不到别人的合同。不能取消最后一个管理员。</p>
+        <div id="userBox"></div>
+      </div>
+      <div class="card" style="margin-top:16px;">
+        <div class="page-title">审计记录</div>
+        <div class="wb-toolbar">
+          <select id="actionFilter">
+            <option value="">全部动作</option>
+            <option value="login_ok">登录成功</option>
+            <option value="login_fail">登录失败</option>
+            <option value="ingest_commit">入库</option>
+            <option value="review_start">开始审查</option>
+            <option value="report_export">导出报告</option>
+            <option value="finding_update">改发现</option>
+            <option value="role_change">改角色</option>
+            <option value="contract_delete">删合同</option>
+            <option value="folder_delete">删文件夹</option>
+            <option value="archive">归档</option>
+            <option value="unarchive">取消归档</option>
+            <option value="model_set">模型设置</option>
+          </select>
+          <button type="button" class="btn btn-ghost btn-sm" id="reloadAudit">刷新</button>
+        </div>
+        <div id="auditBox"></div>
+      </div>
+    </div>
+  </main>
+<script src="/static/main.js?v=8"></script>
+<script>
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+async function loadUsers() {
+  const data = await apiJSON('/api/admin/users');
+  const rows = data.users || [];
+  const box = document.getElementById('userBox');
+  if (!rows.length) {
+    box.innerHTML = '<div class="wb-empty">还没有用户。</div>';
+    return;
+  }
+  box.innerHTML = '<table class="admin-table"><thead><tr><th>用户名</th><th>显示名</th><th>角色</th><th></th></tr></thead><tbody>' +
+    rows.map(u => '<tr data-id="' + u.id + '"><td>' + esc(u.username) + '</td><td>' +
+      esc(u.display_name || '') + '</td><td><select class="role-sel">' +
+      ['admin', 'legal', 'viewer'].map(r =>
+        '<option value="' + r + '"' + (u.role === r ? ' selected' : '') + '>' + r + '</option>'
+      ).join('') +
+      '</select></td><td><button type="button" class="btn btn-primary btn-sm save-role">保存</button></td></tr>'
+    ).join('') + '</tbody></table>';
+  box.querySelectorAll('tr[data-id]').forEach(tr => {
+    tr.querySelector('.save-role').addEventListener('click', async () => {
+      const role = tr.querySelector('.role-sel').value;
+      try {
+        await apiJSON('/api/admin/users/' + tr.dataset.id, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ role })
+        });
+        await loadAudit();
+      } catch (e) {
+        alert(e.message);
+        loadUsers();
+      }
+    });
+  });
+}
+async function loadAudit() {
+  const action = document.getElementById('actionFilter').value;
+  const q = action ? ('?action=' + encodeURIComponent(action) + '&limit=100') : '?limit=100';
+  const data = await apiJSON('/api/admin/audit' + q);
+  const rows = data.logs || [];
+  const box = document.getElementById('auditBox');
+  if (!rows.length) {
+    box.innerHTML = '<div class="wb-empty">没有匹配的审计记录。</div>';
+    return;
+  }
+  box.innerHTML = '<table class="admin-table"><thead><tr><th>时间</th><th>用户</th><th>动作</th><th>对象</th><th>详情</th></tr></thead><tbody>' +
+    rows.map(r => '<tr><td>' + esc(r.created_at || '') + '</td><td>' + esc(r.username || '') +
+      '</td><td>' + esc(r.action || '') + '</td><td>' + esc((r.target_type || '') + (r.target_id ? ' #' + r.target_id : '')) +
+      '</td><td>' + esc(r.detail || '') + '</td></tr>').join('') + '</tbody></table>';
+}
+window.onRole = async function (role) {
+  if (role !== 'admin') {
+    document.getElementById('deny').hidden = false;
+    document.getElementById('panel').hidden = true;
+    return;
+  }
+  document.getElementById('deny').hidden = true;
+  document.getElementById('panel').hidden = false;
+  try {
+    await loadUsers();
+    await loadAudit();
+  } catch (e) {
+    document.getElementById('userBox').textContent = e.message;
+  }
+};
+document.getElementById('actionFilter').addEventListener('change', () => {
+  loadAudit().catch(e => alert(e.message));
+});
+document.getElementById('reloadAudit').addEventListener('click', () => {
+  loadAudit().catch(e => alert(e.message));
+});
+initPage('admin');
+</script>
+</body>
+</html>
